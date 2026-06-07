@@ -51,9 +51,9 @@ async function walk(dir, appDir, urlParts, out) {
     if (e.isFile()) {
       const file = join(dir, e.name);
       if (PAGE_RE.test(e.name)) {
-        out.routes.push({ path: urlToPath(urlParts), type: 'page', file });
+        out.routes.push({ path: urlToPath(urlParts), type: 'page', file, ...dynamicInfo(urlParts) });
       } else if (ROUTE_RE.test(e.name)) {
-        out.routes.push({ path: urlToPath(urlParts), type: 'route-handler', file });
+        out.routes.push({ path: urlToPath(urlParts), type: 'route-handler', file, ...dynamicInfo(urlParts) });
       } else if (STRUCTURAL_RE.test(e.name)) {
         out.structural.push({ kind: e.name.split('.')[0], path: urlToPath(urlParts), file });
       }
@@ -71,7 +71,24 @@ function urlToPath(parts) {
   return p === '/' ? '/' : p.replace(/\/+$/, '');
 }
 
-export async function buildRouteMap(project) {
+// Extract dynamic params from URL parts (":id", "*slug", "*slug?") so each route says what it needs.
+function dynamicInfo(parts) {
+  const params = [];
+  for (const part of parts) {
+    if (part.startsWith(':')) params.push({ name: part.slice(1), kind: 'dynamic' });
+    else if (part.startsWith('*') && part.endsWith('?')) params.push({ name: part.slice(1, -1), kind: 'optional-catch-all' });
+    else if (part.startsWith('*')) params.push({ name: part.slice(1), kind: 'catch-all' });
+  }
+  return { dynamic: params.length > 0, params };
+}
+
+// Filters (all optional):
+//   type:        'page' | 'route-handler'        — only that kind
+//   dynamic:     true | false                    — only dynamic / only static routes
+//   pathContains: substring                      — path must include it (case-insensitive)
+//   pathPrefix:  string                          — path must start with it (e.g. "/:locale/admin")
+//   includeStructural: boolean (default true)    — include layout/loading/error files in output
+export async function buildRouteMap(project, filters = {}) {
   const appDir = await findAppDir(project);
   if (!appDir) {
     return { error: `No App Router directory found under ${project} (looked for src/app, app).` };
@@ -82,11 +99,27 @@ export async function buildRouteMap(project) {
 
   // Apps with a [locale] segment route everything under it -> surface that so the agent prefixes /en etc.
   const localeSegment = out.routes.some((r) => r.path.startsWith('/:locale'));
+
+  const total = out.routes.length;
+  let routes = out.routes;
+  const { type, dynamic, pathContains, pathPrefix, includeStructural = true } = filters || {};
+  if (type) routes = routes.filter((r) => r.type === type);
+  if (typeof dynamic === 'boolean') routes = routes.filter((r) => !!r.dynamic === dynamic);
+  if (pathContains) routes = routes.filter((r) => r.path.toLowerCase().includes(String(pathContains).toLowerCase()));
+  if (pathPrefix) routes = routes.filter((r) => r.path.startsWith(String(pathPrefix)));
+
   return {
     appDir,
     localePrefixed: localeSegment,
-    routeCount: out.routes.length,
-    routes: out.routes,
-    structural: out.structural,
+    totalRoutes: total,
+    routeCount: routes.length,
+    filtered: routes.length !== total,
+    counts: {
+      pages: out.routes.filter((r) => r.type === 'page').length,
+      routeHandlers: out.routes.filter((r) => r.type === 'route-handler').length,
+      dynamic: out.routes.filter((r) => r.dynamic).length,
+    },
+    routes,
+    structural: includeStructural ? out.structural : undefined,
   };
 }

@@ -28,10 +28,17 @@ server.registerTool(
   {
     title: 'Next.js route map',
     description:
-      'List all App Router routes (pages + route handlers) for the configured Next.js project, read from the filesystem. Reports whether routes are locale-prefixed (e.g. /:locale).',
-    inputSchema: {},
+      'List App Router routes (pages + route handlers) for the configured project, read from the filesystem — including DYNAMIC routes: `[id]`→`:id`, `[...slug]`→`*slug`, `[[...slug]]`→`*slug?`. Each route reports `dynamic` and its `params`. Reports whether routes are locale-prefixed (e.g. /:locale). ' +
+      'Filter with: `type` ("page" | "route-handler"), `dynamic` (true=only dynamic, false=only static), `pathContains`, `pathPrefix` (e.g. "/:locale/admin"), and `includeStructural` (default true).',
+    inputSchema: {
+      type: z.enum(['page', 'route-handler']).optional(),
+      dynamic: z.boolean().optional(),
+      pathContains: z.string().optional(),
+      pathPrefix: z.string().optional(),
+      includeStructural: z.boolean().optional(),
+    },
   },
-  async () => json(await buildRouteMap(config.project))
+  async (filters) => json(await buildRouteMap(config.project, filters))
 );
 
 server.registerTool(
@@ -168,6 +175,17 @@ server.registerTool(
 );
 
 server.registerTool(
+  'overview',
+  {
+    title: 'Page overview (landmark map)',
+    description:
+      'Return the structural layout of the current page so you know the lay of the land: `header` (banner + its links/buttons), `nav` (navigation lists + items), `sidebars` (with items), `sections` (landmark regions by heading), `tabs` (tab lists + active tab), `headings` (h1–h3 outline), `footer` (+ items), and `openOverlays` (dialogs/menus currently open and possibly blocking). Use after navigating to understand where things are, then snapshot/find/click into a region. Targets the default tab unless `tabId` is given. Requires a connected tab.',
+    inputSchema: { tabId: z.string().optional() },
+  },
+  async ({ tabId }) => json(await bridge.dispatch('overview', {}, { tabId: tabId ?? null }))
+);
+
+server.registerTool(
   'components',
   {
     title: 'Rendered React component tree',
@@ -230,10 +248,12 @@ server.registerTool(
   {
     title: 'Navigate the tab',
     description:
-      'Navigate a tab to a URL (full-page assign). Remember locale prefix, e.g. /en/.... Targets the default tab unless `tabId` is given (or `all` to navigate every tab).',
+      'Navigate a tab to a URL and return a page `overview` (landmark map: header/nav/sidebars/sections/tabs/headings/footer/openOverlays). Remember locale prefix, e.g. /en/.... ' +
+      'For a full-document load the overview reflects the page at call time — if it just unloaded, call `overview` again once it has loaded (use wait_for first). Targets the default tab unless `tabId` is given (or `all`).',
     inputSchema: { url: z.string(), ...TAB_TARGET },
   },
-  async ({ url, tabId, all }) => json(await bridge.dispatch('navigate', { url }, targetOpts({ tabId, all })))
+  async ({ url, tabId, all }) =>
+    json(await bridge.dispatch('navigate', { url }, targetOpts({ tabId, all }, { timeoutMs: 8000 })))
 );
 
 server.registerTool(

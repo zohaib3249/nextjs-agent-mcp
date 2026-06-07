@@ -16,6 +16,7 @@ export const OPS = Object.freeze({
   FILL: 'fill',
   SNAPSHOT: 'snapshot',
   PAGE_CONTEXT: 'page_context',
+  OVERVIEW: 'overview',
   COMPONENTS: 'components',
   COMPONENT_FOR: 'component_for',
   RERENDER: 'rerender',

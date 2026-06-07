@@ -324,6 +324,7 @@ function describe(cmd) {
   if (cmd.op === "eval") return String(a.code).slice(0, 28);
   if (cmd.op === "screenshot") return "capturing\u2026";
   if (cmd.op === "find") return `find "${String(a.query)}"`;
+  if (cmd.op === "overview") return "page overview\u2026";
   if (a.selector) return String(a.selector);
   return "";
 }
@@ -347,9 +348,16 @@ async function run(op, args) {
       return doOpenTab(String(args.url));
     case "wait_for":
       return doWaitFor(args);
-    case "navigate":
-      location.assign(String(args.url));
-      return { navigated: String(args.url) };
+    case "overview":
+      return doOverview();
+    case "navigate": {
+      const url = String(args.url);
+      const before = location.href;
+      location.assign(url);
+      await new Promise((r) => setTimeout(r, 350));
+      const navigatedWithinDoc = location.href !== before && document.readyState === "complete";
+      return { navigated: url, sameDocument: navigatedWithinDoc, overview: doOverview() };
+    }
     case "reload":
       if (args.hard) location.replace(location.href.split("#")[0]);
       else location.reload();
@@ -865,6 +873,88 @@ function doSnapshot() {
     fields,
     actions,
     values
+  };
+}
+function inHudEl(n) {
+  return !!n.closest("[data-agent-bridge-hud]");
+}
+function visible(e) {
+  const el2 = e;
+  if (inHudEl(e)) return false;
+  const r = el2.getBoundingClientRect();
+  return r.width > 0 || r.height > 0 || el2.offsetParent !== null;
+}
+function regionItems(root, cap = 40) {
+  const els = [...root.querySelectorAll('a[href], button, [role="link"], [role="button"], [role="menuitem"], [role="tab"]')].filter((n) => !inHudEl(n)).slice(0, cap);
+  return els.map((e) => {
+    const text = (e.getAttribute("aria-label") || e.textContent || "").trim().slice(0, 60);
+    const item = { text, selector: stableSelector(e) };
+    const href = e.getAttribute?.("href");
+    if (href) item.href = href;
+    return item;
+  }).filter((i) => i.text || i.href);
+}
+function regionFor(sel, root) {
+  if (!root || !visible(root)) return null;
+  return { selector: stableSelector(root), items: regionItems(root) };
+}
+function doOverview() {
+  const headerEl = document.querySelector('header, [role="banner"]');
+  const header = regionFor("header", headerEl);
+  const footerEl = document.querySelector('footer, [role="contentinfo"]');
+  const footer = regionFor("footer", footerEl);
+  const navs = [...document.querySelectorAll('nav, [role="navigation"]')].filter(visible).slice(0, 6).map((n) => ({
+    label: (n.getAttribute("aria-label") || "").trim() || null,
+    selector: stableSelector(n),
+    items: regionItems(n, 30)
+  }));
+  const sidebarEls = [
+    ...document.querySelectorAll('aside, [role="complementary"], [class*="sidebar" i], [data-sidebar], [class*="drawer" i]')
+  ].filter(visible).slice(0, 4);
+  const sidebars = sidebarEls.map((s) => ({
+    selector: stableSelector(s),
+    label: (s.getAttribute("aria-label") || "").trim() || null,
+    items: regionItems(s, 40)
+  }));
+  const sections = [...document.querySelectorAll('section, [role="region"], main [aria-labelledby], main > div[class*="section" i]')].filter(visible).slice(0, 20).map((s) => {
+    const h = s.querySelector('h1, h2, h3, [role="heading"]');
+    return {
+      heading: (h?.textContent || s.getAttribute("aria-label") || "").trim().slice(0, 80) || null,
+      selector: stableSelector(s)
+    };
+  }).filter((s) => s.heading);
+  const tabLists = [...document.querySelectorAll('[role="tablist"]')].filter(visible).slice(0, 6).map((tl) => {
+    const tabs = [...tl.querySelectorAll('[role="tab"]')].filter((t) => !inHudEl(t)).map((t) => ({
+      text: (t.textContent || "").trim().slice(0, 50),
+      selected: t.getAttribute("aria-selected") === "true",
+      selector: stableSelector(t)
+    }));
+    return { selector: stableSelector(tl), activeTab: tabs.find((x) => x.selected)?.text || null, tabs };
+  });
+  const headings = [...document.querySelectorAll("h1, h2, h3")].filter(visible).slice(0, 40).map((h) => ({ level: Number(h.tagName[1]), text: (h.textContent || "").trim().slice(0, 90) })).filter((h) => h.text);
+  const openOverlays = [...document.querySelectorAll('[role="dialog"], [role="alertdialog"], [role="menu"], dialog[open], [aria-modal="true"]')].filter(visible).slice(0, 8).map((o) => ({
+    role: o.getAttribute("role") || o.tagName.toLowerCase(),
+    label: (o.getAttribute("aria-label") || o.querySelector('h1,h2,h3,[role="heading"]')?.textContent || "").trim().slice(0, 80) || null,
+    selector: stableSelector(o)
+  }));
+  return {
+    route: doPageContext(),
+    header,
+    nav: navs,
+    sidebars,
+    sections,
+    tabs: tabLists,
+    headings,
+    footer,
+    openOverlays,
+    counts: {
+      nav: navs.length,
+      sidebars: sidebars.length,
+      sections: sections.length,
+      tabLists: tabLists.length,
+      headings: headings.length,
+      openOverlays: openOverlays.length
+    }
   };
 }
 async function doWaitFor(args) {
