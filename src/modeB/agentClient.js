@@ -75,13 +75,20 @@ export class AgentClient {
     }
     if (m.t === 'tabs') {
       this.tabs = m.tabs || [];
-      // If our bound tab vanished, clear the binding.
-      if (this.boundTabId && !this.tabs.some((x) => x.tabId === this.boundTabId)) this.boundTabId = null;
+      // NOTE: do NOT clear boundTabId just because the tab is briefly absent from the list — a
+      // reload/navigation drops the socket for a moment but the broker KEEPS our binding and will
+      // send {t:'rebound'} when the tab reconnects. Clearing here is what made every reload/navigate
+      // require a manual re-claim. We only drop the binding on an explicit {t:'released'}.
       return;
     }
     if (m.t === 'claimed') {
       this.boundTabId = m.tabId;
       this._resolveClaim({ ok: true, tabId: m.tabId });
+      return;
+    }
+    if (m.t === 'rebound') {
+      // Our tab reloaded/navigated and reconnected — the broker restored our binding.
+      this.boundTabId = m.tabId;
       return;
     }
     if (m.t === 'needTab') {
@@ -149,15 +156,47 @@ export class AgentClient {
     return { ok: true, released: tabId };
   }
 
-  // Send an op to the agent's BOUND tab and await the result.
-  dispatch(op, args = {}, { timeoutMs = 10000, message = null, intent = null } = {}) {
-    if (!this.connected) return Promise.resolve({ ok: false, error: 'agent not connected to broker' });
-    if (!this.boundTabId) {
-      return Promise.resolve({
-        ok: false,
-        error: 'No tab claimed. Call claim_tab first (it binds a free tab or opens a new one).',
-      });
+  // Is our bound tab currently connected to the broker?
+  _boundTabPresent() {
+    return !!this.boundTabId && this.tabs.some((x) => x.tabId === this.boundTabId);
+  }
+
+  // Wait (up to ms) for our bound tab to (re)appear — covers the brief gap during a reload/navigate.
+  async _awaitBoundTab(ms = 8000) {
+    if (this._boundTabPresent()) return true;
+    const start = Date.now();
+    while (Date.now() - start < ms) {
+      this._send({ t: 'list' }); // refresh tabs
+      await new Promise((r) => setTimeout(r, 200));
+      if (this._boundTabPresent()) return true;
     }
+    return this._boundTabPresent();
+  }
+
+  // Send an op to the agent's BOUND tab and await the result. If the tab is momentarily gone
+  // (mid reload/navigation), wait for it to reconnect rather than failing — so callers don't have
+  // to re-claim after every navigate/reload.
+  async dispatch(op, args = {}, { timeoutMs = 10000, message = null, intent = null } = {}) {
+    if (!this.connected) return { ok: false, error: 'agent not connected to broker' };
+    if (!this.boundTabId) {
+      return { ok: false, error: 'No tab claimed. Call claim_tab first (it binds a free tab or opens a new one).' };
+    }
+    if (!this._boundTabPresent()) {
+      const back = await this._awaitBoundTab(Math.min(timeoutMs, 8000));
+      if (!back) return { ok: false, error: 'Bound tab is not connected (still loading?). Retry shortly or re-claim.' };
+    }
+    const send1 = () => this._once(op, args, { timeoutMs, message, intent });
+    let res = await send1();
+    // If the op timed out AND the tab (re)appeared meanwhile — likely a reload/navigation swallowed
+    // the in-flight command — try ONCE more against the reconnected tab.
+    if (!res.ok && /Timed out/.test(res.error || '') && (await this._awaitBoundTab(3000))) {
+      res = await this._once(op, args, { timeoutMs, message, intent });
+    }
+    return res;
+  }
+
+  // One round-trip to the bound tab.
+  _once(op, args, { timeoutMs, message, intent }) {
     const id = ++this._seq;
     return new Promise((resolve) => {
       const timer = setTimeout(() => {

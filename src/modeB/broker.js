@@ -118,7 +118,11 @@ export class Broker {
     if (b) {
       const ag = this.agents.get(b.agentId);
       if (ag) {
+        // Restore the page HUD…
         this._send(ws, { t: 'claimed', agentId: b.agentId, agentName: ag._meta.name, intent: b.intent || '' });
+        // …and tell the OWNING AGENT its tab came back, so its boundTabId is restored (the agent
+        // had cleared it when the socket dropped during the reload/navigation).
+        this._send(ag, { t: 'rebound', tabId, intent: b.intent || '' });
       } else {
         // Owner gone while the tab was away → free it.
         this.binding.delete(tabId);
