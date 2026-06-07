@@ -11,26 +11,50 @@
 // Drop into a Next.js root layout, dev-gated:
 //   {process.env.NODE_ENV === 'development' && <AgentBridge />}
 // Ships nothing to production. Port must match the MCP's --ws-port (default 7333).
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 
 const WS_PORT = Number(process.env.NEXT_PUBLIC_AGENT_BRIDGE_PORT) || 7333;
+// The MCP auto-advances its WS port if the base is busy; the bridge scans the same range so it
+// still finds the server without manual reconfiguration.
+const WS_PORT_RANGE = 11;
 
-// Stable per-tab id: persisted in sessionStorage so it survives reloads of THIS tab but is unique
-// per browser tab (sessionStorage is per-tab). Lets the agent target one tab among many.
-function getTabId(): string {
+// Stable per-tab id that survives reloads of THIS tab but is unique per browser tab.
+//
+// IMPORTANT: sessionStorage is per-tab BUT a tab opened via "Duplicate tab" or a `target=_blank`
+// link inherits a COPY of the opener's sessionStorage — so multiple tabs can start with the same
+// id. To guarantee uniqueness we anchor the id to `window.name` (which is per-tab and is NOT
+// duplicated the way sessionStorage is). We also generate a strong random suffix. The MCP server
+// independently de-dupes on connect as a final guarantee (see wsServer assignUniqueTabId).
+function rand(): string {
   try {
-    const k = '__agent_bridge_tab_id';
-    let v = sessionStorage.getItem(k);
-    if (!v) {
-      v = 'tab-' + Math.random().toString(36).slice(2, 8) + '-' + (Date.now() % 100000);
-      sessionStorage.setItem(k, v);
-    }
-    return v;
+    const a = new Uint32Array(2);
+    crypto.getRandomValues(a);
+    return a[0].toString(36) + a[1].toString(36);
   } catch {
-    return 'tab-' + Math.random().toString(36).slice(2, 8);
+    return Math.random().toString(36).slice(2) + Math.random().toString(36).slice(2);
   }
 }
-const TAB_ID = typeof window !== 'undefined' ? getTabId() : 'tab-ssr';
+function getTabId(): string {
+  try {
+    // window.name persists across reloads of this exact tab and is not shared with other tabs.
+    if (window.name && window.name.startsWith('agbid:')) return window.name.slice(6);
+    const id = 'tab-' + rand().slice(0, 10);
+    window.name = 'agbid:' + id;
+    return id;
+  } catch {
+    return 'tab-' + rand().slice(0, 10);
+  }
+}
+// Mutable: the MCP server may reassign a unique id on connect if it detects a duplicate.
+let TAB_ID = typeof window !== 'undefined' ? getTabId() : 'tab-ssr';
+function adoptTabId(id: string) {
+  TAB_ID = id;
+  try {
+    window.name = 'agbid:' + id;
+  } catch {
+    /* ignore */
+  }
+}
 
 // ---- Network recorder (module-level, installed once at import) -------------------------------
 // Captures fetch + XHR (method, status, type, timing, and capped response bodies) plus
@@ -194,41 +218,124 @@ function installNetworkRecorder() {
 // Install as early as the module loads on the client so we don't miss initial requests.
 if (typeof window !== 'undefined') installNetworkRecorder();
 
-type Command = { kind: 'command'; id: number; op: string; args: Record<string, unknown> };
+type Command = { kind: 'command'; id: number; op: string; args: Record<string, unknown>; message?: string | null };
 type Status = 'connecting' | 'connected' | 'disconnected';
-type FeedItem = { id: number; op: string; detail: string; state: 'running' | 'ok' | 'error'; ts: number };
+
+// User-controllable HUD preferences, persisted per browser.
+// `pos` is the panel's top-left corner; null = default (anchored bottom-right).
+type Prefs = { fx: boolean; collapsed: boolean; speed: number; pos: { x: number; y: number } | null };
+const PREFS_KEY = '__agent_bridge_prefs';
+const DEFAULT_PREFS: Prefs = { fx: true, collapsed: false, speed: 1, pos: null };
+function loadPrefs(): Prefs {
+  try {
+    return { ...DEFAULT_PREFS, ...JSON.parse(localStorage.getItem(PREFS_KEY) || '{}') };
+  } catch {
+    return DEFAULT_PREFS;
+  }
+}
+function savePrefs(p: Prefs) {
+  try {
+    localStorage.setItem(PREFS_KEY, JSON.stringify(p));
+  } catch {
+    /* ignore */
+  }
+}
+
+// FX engine handle, set by the component so op implementations (run elsewhere) can drive visuals.
+let FX: AgentFx | null = null;
 
 export default function AgentBridge() {
   const [status, setStatus] = useState<Status>('connecting');
-  const [feed, setFeed] = useState<FeedItem[]>([]);
   const [busy, setBusy] = useState(false);
+  const [thinking, setThinking] = useState<string | null>(null);
+  const [paused, setPaused] = useState(false);
+  const [tabIdState, setTabIdState] = useState<string>(TAB_ID);
+  // Start from deterministic defaults so SSR and the first client render match (no hydration
+  // mismatch); load the real persisted prefs only after mount.
+  const [prefs, setPrefs] = useState<Prefs>(DEFAULT_PREFS);
+  const [mounted, setMounted] = useState(false);
+  useEffect(() => {
+    setPrefs(loadPrefs());
+    setMounted(true);
+  }, []);
+
+  const fxLayer = useRef<HTMLDivElement | null>(null);
+  const pausedRef = useRef(paused);
+  const prefsRef = useRef(prefs);
+  const resumeWaiters = useRef<Array<() => void>>([]);
+  pausedRef.current = paused;
+  prefsRef.current = prefs;
+
+  // Persist prefs (only after mount, so we don't overwrite stored prefs with defaults pre-load).
+  useEffect(() => {
+    if (mounted) savePrefs(prefs);
+  }, [prefs, mounted]);
+  useEffect(() => {
+    if (!paused) {
+      const w = resumeWaiters.current;
+      resumeWaiters.current = [];
+      w.forEach((r) => r());
+    }
+  }, [paused]);
+
+  // Build the FX engine once we have the overlay node + prefs accessor.
+  useEffect(() => {
+    FX = new AgentFx(() => fxLayer.current, () => prefsRef.current);
+    // Always show the persistent bottom status bar once the FX layer is mounted (after a tick so
+    // the overlay div exists), provided FX is enabled.
+    const t = setTimeout(() => {
+      if (prefsRef.current.fx) FX?.showBar(status === 'connected' ? 'Agent connected — ready' : 'Waiting for the agent…');
+    }, 50);
+    return () => {
+      clearTimeout(t);
+      FX = null;
+    };
+  }, []);
+
+  // Reflect connection state + FX toggle on the persistent bar.
+  useEffect(() => {
+    if (!FX) return;
+    if (!prefs.fx) FX.hideBar();
+    else FX.showBar(status === 'connected' ? 'Agent connected — ready' : status === 'connecting' ? 'Connecting…' : 'Agent offline');
+  }, [status, prefs.fx]);
 
   useEffect(() => {
     let ws: WebSocket | null = null;
     let closed = false;
     let retry: ReturnType<typeof setTimeout> | null = null;
-    let feedSeq = 0;
 
-    const pushFeed = (op: string, detail: string): number => {
-      const fid = ++feedSeq;
-      const item: FeedItem = { id: fid, op, detail, state: 'running', ts: Date.now() };
-      setFeed((f) => [item, ...f].slice(0, 8));
-      return fid;
-    };
-    const settleFeed = (fid: number, state: 'ok' | 'error') =>
-      setFeed((f) => f.map((it) => (it.id === fid ? { ...it, state } : it)));
+    // Gate command execution while paused.
+    const waitWhilePaused = () =>
+      pausedRef.current ? new Promise<void>((r) => resumeWaiters.current.push(r)) : Promise.resolve();
 
+    let portOffset = 0; // scans WS_PORT .. WS_PORT+RANGE-1, then wraps
     const connect = () => {
       if (closed) return;
       setStatus('connecting');
+      const port = WS_PORT + (portOffset % WS_PORT_RANGE);
+      let opened = false;
       try {
-        ws = new WebSocket(`ws://localhost:${WS_PORT}`);
+        ws = new WebSocket(`ws://localhost:${port}`);
       } catch {
-        retry = setTimeout(connect, 1500);
+        portOffset++;
+        retry = setTimeout(connect, 400);
         return;
       }
+      // If this port doesn't open quickly, advance to the next one in the range.
+      const tryNext = setTimeout(() => {
+        if (!opened) {
+          portOffset++;
+          try {
+            ws?.close();
+          } catch {
+            /* ignore */
+          }
+        }
+      }, 700);
 
       ws.onopen = () => {
+        opened = true;
+        clearTimeout(tryNext);
         setStatus('connected');
         ws!.send(
           JSON.stringify({
@@ -240,6 +347,8 @@ export default function AgentBridge() {
             userAgent: navigator.userAgent,
           })
         );
+        // Show the persistent bottom status bar as soon as we connect.
+        if (prefsRef.current.fx) FX?.showBar('Agent connected — ready');
       };
 
       ws.onmessage = async (ev) => {
@@ -249,16 +358,70 @@ export default function AgentBridge() {
         } catch {
           return;
         }
+        // Server resolved a duplicate id → adopt the unique one it assigned.
+        if ((cmd as { kind?: string }).kind === 'assignTabId') {
+          const newId = (cmd as unknown as { tabId?: string }).tabId;
+          if (newId) {
+            adoptTabId(newId);
+            setTabIdState(newId);
+          }
+          return;
+        }
         if (cmd.kind !== 'command') return;
-        const fid = pushFeed(cmd.op, describe(cmd));
+
+        // The agent's narration for this call: explicit `message`, else the think arg, else a label.
+        const narration = String(cmd.message ?? cmd.args?.message ?? '').slice(0, 300);
+
+        // `think` / `status` are narration-only ops: type into the bar, run nothing in the page.
+        // `kind`: 'thinking' (💭 internal reasoning) | 'code' (⌘ checking code) | 'action' (✦).
+        if (cmd.op === 'think' || cmd.op === 'status') {
+          const msg = narration;
+          const kind = (cmd.args?.kind as string) || (cmd.op === 'think' ? 'thinking' : 'action');
+          const dwellMs = typeof cmd.args?.dwellMs === 'number' ? (cmd.args.dwellMs as number) : undefined;
+          setThinking(msg);
+          if (prefsRef.current.fx) FX?.say(msg, dwellMs, kind);
+          send({ kind: 'result', id: cmd.id, ok: true, value: { acknowledged: true } });
+          return;
+        }
+
+        // Honor a pause: hold the command until the user resumes.
+        if (pausedRef.current) {
+          await waitWhilePaused();
+        }
+
+        setThinking(narration || actionLabel(cmd));
         setBusy(true);
         try {
-          highlight(cmd);
-          const value = await run(cmd.op, cmd.args);
-          settleFeed(fid, 'ok');
+          let value: unknown;
+          if (prefsRef.current.fx) {
+            // Type the agent's narration (or a friendly phrase) in the unified toast, then act.
+            FX?.say(narration || actionLabel(cmd));
+            // fill_form: walk each field like a person — cursor travels, spotlight, fast typewriter.
+            if (cmd.op === 'fill_form' && FX) {
+              value = await FX.fillForm(
+                (cmd.args.fields as Array<{ selector: string; value: string }>) || [],
+                narration
+              );
+            } else {
+              await FX?.before(cmd);
+              if (cmd.op === 'fill' && FX) {
+                value = await FX.typeFill(String(cmd.args.selector), String(cmd.args.value ?? ''));
+              } else {
+                value = await run(cmd.op, cmd.args);
+              }
+            }
+          } else {
+            // FX off: fill_form still fills every field, just without animation.
+            if (cmd.op === 'fill_form') {
+              value = await run('fill_form', cmd.args);
+            } else {
+              value = await run(cmd.op, cmd.args);
+            }
+          }
+          if (prefsRef.current.fx) FX?.after(cmd);
           send({ kind: 'result', id: cmd.id, ok: true, value });
         } catch (err: unknown) {
-          settleFeed(fid, 'error');
+          if (prefsRef.current.fx) FX?.fail(cmd);
           send({ kind: 'result', id: cmd.id, ok: false, error: errMsg(err) });
         } finally {
           setBusy(false);
@@ -266,9 +429,13 @@ export default function AgentBridge() {
       };
 
       ws.onclose = () => {
+        clearTimeout(tryNext);
         ws = null;
         setStatus('disconnected');
-        if (!closed) retry = setTimeout(connect, 1500);
+        // If we never connected, advance through the range quickly; once we had a connection,
+        // back off a bit before rescanning from the same offset.
+        const delay = opened ? 1200 : 250;
+        if (!closed) retry = setTimeout(connect, delay);
       };
       ws.onerror = () => ws?.close();
     };
@@ -317,96 +484,699 @@ export default function AgentBridge() {
     };
   }, []);
 
-  return <Hud status={status} feed={feed} busy={busy} />;
+  // Render nothing on the server / first hydration pass — the HUD depends on browser-only state
+  // (sessionStorage tab id, localStorage prefs), so SSR output would never match the client.
+  if (!mounted) return null;
+
+  return (
+    <>
+      {/* Full-screen, non-interactive FX layer (cursor, spotlight, tooltip, ripples, toasts). */}
+      <div
+        ref={fxLayer}
+        data-agent-bridge-hud
+        style={{ position: 'fixed', inset: 0, zIndex: 2147483646, pointerEvents: 'none', overflow: 'hidden' }}
+      />
+      <Hud
+        status={status}
+        busy={busy}
+        thinking={thinking}
+        paused={paused}
+        tabId={tabIdState}
+        prefs={prefs}
+        onTogglePause={() => setPaused((p) => !p)}
+        onToggleFx={() => setPrefs((p) => ({ ...p, fx: !p.fx }))}
+        onToggleCollapsed={() => setPrefs((p) => ({ ...p, collapsed: !p.collapsed }))}
+        onSpeed={(v) => setPrefs((p) => ({ ...p, speed: v }))}
+        onMove={(pos) => setPrefs((p) => ({ ...p, pos }))}
+      />
+    </>
+  );
 }
 
-// ---- HUD (visible overlay) -------------------------------------------------
+// ---- Fancy FX engine -------------------------------------------------------
+// Drives the visible "controlled agent" effects on the page: a traveling cursor, click ripple,
+// element spotlight with a labeled tooltip, typewriter fill caret, and thinking toasts.
+// All effects are gated by the user's `fx` pref and paced by `speed`.
+class AgentFx {
+  private getLayer: () => HTMLDivElement | null;
+  private getPrefs: () => Prefs;
+  private cursor: HTMLDivElement | null = null;
+  private spot: HTMLDivElement | null = null;
+  private tip: HTMLDivElement | null = null;
+  private cx = -100;
+  private cy = -100;
+  // Persistent "speech" toast that types out the agent's narration (Claude-Code style).
+  private sayBox: HTMLDivElement | null = null;
+  private sayText: HTMLSpanElement | null = null;
+  private sayDot: HTMLSpanElement | null = null;
+  private sayToken = 0; // cancels an in-flight typing animation when a newer one starts
+  private sayHideTimer: ReturnType<typeof setTimeout> | null = null;
+  private idleTimer: ReturnType<typeof setTimeout> | null = null;
+  private idleIdx = 0;
+  private static IDLE_PHRASES = [
+    'Thinking…',
+    'Planning the next step…',
+    'Looking around the page…',
+    'Waiting for the agent…',
+    'Working on it…',
+    'Reading the layout…',
+    'Reasoning about what to do next…',
+    'Scanning for the right element…',
+    'Checking the page state…',
+    'Considering the options…',
+    'Mapping out the form…',
+    'Reviewing the DOM…',
+    'Inspecting the components…',
+    'Figuring out the next action…',
+    'Gathering context…',
+    'Analyzing the structure…',
+    'Locating the controls…',
+    'Double-checking the selectors…',
+    'Tracing the data flow…',
+    'Looking for the submit button…',
+    'Parsing the response…',
+    'Verifying the result…',
+    'Waiting for the page to settle…',
+    'Hold on, almost there…',
+    'Lining things up…',
+    'Cross-referencing the routes…',
+    'Reading the network activity…',
+    'Checking for errors…',
+    'Making sure everything loaded…',
+    'Deciding where to click…',
+    'Composing the next move…',
+    'Sizing up the page…',
+    'Looking for the right field…',
+    'Re-reading the requirements…',
+    'Connecting the dots…',
+    'Evaluating the state…',
+    'Preparing the next step…',
+    'Sketching a plan…',
+    'Picking the best approach…',
+    'Confirming the route…',
+    'Sweeping the interface…',
+    'Reading labels and inputs…',
+    'Watching for changes…',
+    'Letting the UI catch up…',
+    'Tidying up the plan…',
+    'Queuing the next action…',
+    'Checking the form values…',
+    'Looking at what changed…',
+    'Re-orienting on the page…',
+    'Thinking it through…',
+    'Almost ready…',
+    'Just a moment…',
+    'Processing…',
+  ];
+  private static MIN_DWELL_MS = 10000; // a message stays at least this long before idle phrases
 
-function Hud({ status, feed, busy }: { status: Status; feed: FeedItem[]; busy: boolean }) {
+  constructor(getLayer: () => HTMLDivElement | null, getPrefs: () => Prefs) {
+    this.getLayer = getLayer;
+    this.getPrefs = getPrefs;
+  }
+
+  private speed() {
+    return this.getPrefs().speed || 1;
+  }
+  // Pace by speed, but floor so a high speed setting can never make effects invisible.
+  private ms(base: number) {
+    return Math.max(220, base / this.speed());
+  }
+
+  private ensureCursor() {
+    const layer = this.getLayer();
+    if (!layer) return null;
+    if (!this.cursor) {
+      const c = document.createElement('div');
+      // Big glowing pointer + a pulsing halo ring so the travel is unmistakable.
+      c.style.cssText =
+        'position:absolute;width:30px;height:30px;left:0;top:0;transform:translate(-200px,-200px);' +
+        'transition:transform .55s cubic-bezier(.22,1,.36,1);z-index:6;will-change:transform;' +
+        "background:no-repeat center/contain url(\"data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'><path d='M3 2l7 18 2.5-7.5L20 10z' fill='%2338bdf8' stroke='white' stroke-width='1.5' stroke-linejoin='round'/></svg>\");" +
+        'filter:drop-shadow(0 0 8px rgba(56,189,248,.95)) drop-shadow(0 2px 4px rgba(0,0,0,.5));';
+      const halo = document.createElement('div');
+      halo.style.cssText =
+        'position:absolute;left:-9px;top:-9px;width:30px;height:30px;border-radius:50%;' +
+        'background:radial-gradient(circle,rgba(56,189,248,.45),rgba(56,189,248,0) 70%);' +
+        'animation:agentCursorPulse 1.4s ease-out infinite;';
+      c.appendChild(halo);
+      layer.appendChild(c);
+      this.cursor = c;
+    }
+    return this.cursor;
+  }
+
+  private rectOf(sel?: string): DOMRect | null {
+    if (!sel) return null;
+    const el = document.querySelector(sel) as HTMLElement | null;
+    if (!el) return null;
+    el.scrollIntoView({ block: 'center', behavior: 'smooth' });
+    return el.getBoundingClientRect();
+  }
+
+  // Glide the cursor to a point and resolve when it arrives.
+  private moveTo(x: number, y: number): Promise<void> {
+    const c = this.ensureCursor();
+    if (!c) return Promise.resolve();
+    this.cx = x;
+    this.cy = y;
+    c.style.transitionDuration = `${this.ms(500)}ms`;
+    c.style.transform = `translate(${x}px, ${y}px)`;
+    return new Promise((r) => setTimeout(r, this.ms(520)));
+  }
+
+  // Spotlight + labeled tooltip around a rect.
+  private spotlight(rect: DOMRect, label: string) {
+    const layer = this.getLayer();
+    if (!layer) return;
+    if (!this.spot) {
+      this.spot = document.createElement('div');
+      // Strong cyan ring + a heavy page-dim + glow, with a pulse so it's impossible to miss.
+      this.spot.style.cssText =
+        'position:absolute;border-radius:10px;z-index:3;pointer-events:none;' +
+        'box-shadow:0 0 0 3px #38bdf8, 0 0 0 100000px rgba(2,6,23,.6), 0 0 30px 6px rgba(56,189,248,.85);' +
+        'transition:all .4s cubic-bezier(.22,1,.36,1);animation:agentSpotPulse 1.1s ease-in-out infinite;';
+      layer.appendChild(this.spot);
+    }
+    const pad = 6;
+    this.spot.style.left = `${rect.left - pad}px`;
+    this.spot.style.top = `${rect.top - pad}px`;
+    this.spot.style.width = `${rect.width + pad * 2}px`;
+    this.spot.style.height = `${rect.height + pad * 2}px`;
+    this.spot.style.opacity = '1';
+
+    if (!this.tip) {
+      this.tip = document.createElement('div');
+      this.tip.style.cssText =
+        'position:absolute;z-index:5;pointer-events:none;max-width:300px;padding:6px 11px;border-radius:8px;' +
+        'font:700 13px/1.3 ui-sans-serif,system-ui,sans-serif;color:#fff;background:#0ea5e9;' +
+        'box-shadow:0 8px 22px rgba(0,0,0,.45);transition:all .3s ease;white-space:nowrap;' +
+        'overflow:hidden;text-overflow:ellipsis;';
+      layer.appendChild(this.tip);
+    }
+    this.tip.style.background = '#0ea5e9';
+    this.tip.textContent = label;
+    const top = rect.top - 36 < 8 ? rect.bottom + 10 : rect.top - 36;
+    this.tip.style.left = `${Math.max(8, rect.left)}px`;
+    this.tip.style.top = `${top}px`;
+    this.tip.style.opacity = '1';
+  }
+
+  private clearSpotlight() {
+    if (this.spot) this.spot.style.opacity = '0';
+    if (this.tip) this.tip.style.opacity = '0';
+  }
+
+  // Click ripple at the current cursor position.
+  private ripple() {
+    const layer = this.getLayer();
+    if (!layer) return;
+    const r = document.createElement('div');
+    r.style.cssText =
+      `position:absolute;left:${this.cx}px;top:${this.cy}px;width:8px;height:8px;border-radius:50%;` +
+      'background:rgba(56,189,248,.55);z-index:3;transform:translate(-50%,-50%);' +
+      `animation:agentRipple ${this.ms(550)}ms ease-out forwards;`;
+    layer.appendChild(r);
+    setTimeout(() => r.remove(), this.ms(600));
+  }
+
+  // A floating toast at top-center (like a navigation toast). Used for thinking + notices.
+  // Both kinds use the dark/black style the user prefers; thinking gets a 💭 and an accent bar.
+  toast(text: string, kind: 'think' | 'info' = 'info') {
+    const layer = this.getLayer();
+    if (!layer || !text) return;
+    const t = document.createElement('div');
+    t.style.cssText =
+      'position:absolute;left:50%;top:18px;transform:translateX(-50%) translateY(-12px);z-index:7;' +
+      'display:flex;align-items:center;gap:9px;max-width:min(640px,90vw);padding:11px 16px;border-radius:12px;' +
+      'color:#f1f5f9;font:600 14px/1.4 ui-sans-serif,system-ui,sans-serif;background:rgba(15,23,42,.97);' +
+      'border:1px solid ' + (kind === 'think' ? '#8b5cf6' : '#334155') + ';' +
+      'box-shadow:0 14px 40px rgba(0,0,0,.55);opacity:0;transition:all .4s cubic-bezier(.22,1,.36,1);' +
+      'white-space:nowrap;overflow:hidden;text-overflow:ellipsis;';
+    if (kind === 'think') {
+      const dot = document.createElement('span');
+      dot.style.cssText = 'flex:0 0 auto;font-size:16px;';
+      dot.textContent = '💭';
+      t.appendChild(dot);
+    }
+    const span = document.createElement('span');
+    span.style.cssText = 'overflow:hidden;text-overflow:ellipsis;';
+    span.textContent = text;
+    t.appendChild(span);
+    layer.appendChild(t);
+    requestAnimationFrame(() => {
+      t.style.opacity = '1';
+      t.style.transform = 'translateX(-50%) translateY(0)';
+    });
+    const life = kind === 'think' ? this.ms(4200) : this.ms(2800);
+    setTimeout(() => {
+      t.style.opacity = '0';
+      t.style.transform = 'translateX(-50%) translateY(-12px)';
+      setTimeout(() => t.remove(), 420);
+    }, life);
+  }
+
+  // A persistent status bar fixed to the BOTTOM-CENTER of the screen (not page-anchored). Created
+  // once and kept visible from connection onward; say() retypes its text.
+  private ensureSayBox() {
+    const layer = this.getLayer();
+    if (!layer) return null;
+    if (!this.sayBox) {
+      const box = document.createElement('div');
+      box.style.cssText =
+        'position:fixed;left:50%;bottom:18px;transform:translateX(-50%);z-index:2147483646;' +
+        'display:flex;align-items:center;gap:10px;max-width:min(760px,94vw);min-width:240px;padding:12px 18px;border-radius:14px;' +
+        'color:#f1f5f9;font:600 14px/1.4 ui-sans-serif,system-ui,sans-serif;background:rgba(12,18,32,.97);' +
+        'border:1px solid #334155;box-shadow:0 18px 50px rgba(0,0,0,.6);opacity:0;' +
+        'transition:opacity .3s ease;white-space:nowrap;pointer-events:none;';
+      const dot = document.createElement('span');
+      dot.textContent = '✦';
+      dot.style.cssText = 'flex:0 0 auto;color:#a78bfa;font-size:16px;animation:agentThink 1.6s ease-in-out infinite;';
+      const txt = document.createElement('span');
+      txt.style.cssText = 'overflow:hidden;text-overflow:ellipsis;';
+      const caret = document.createElement('span');
+      caret.textContent = '▌';
+      caret.style.cssText = 'color:#a78bfa;animation:agentCaret 1s step-end infinite;margin-left:1px;flex:0 0 auto;';
+      box.appendChild(dot);
+      box.appendChild(txt);
+      box.appendChild(caret);
+      layer.appendChild(box);
+      this.sayBox = box;
+      this.sayText = txt;
+      this.sayDot = dot;
+    }
+    return this.sayBox;
+  }
+
+  // Show the status bar (call on connect) with idle text. Stays visible.
+  showBar(idle = 'Agent connected — ready') {
+    const box = this.ensureSayBox();
+    if (!box || !this.sayText) return;
+    box.style.opacity = '1';
+    if (!this.sayText.textContent) this.sayText.textContent = idle;
+  }
+  hideBar() {
+    if (this.sayBox) this.sayBox.style.opacity = '0';
+  }
+
+  private clearTimers() {
+    if (this.sayHideTimer) clearTimeout(this.sayHideTimer);
+    if (this.idleTimer) clearTimeout(this.idleTimer);
+    this.sayHideTimer = null;
+    this.idleTimer = null;
+  }
+
+  // After a message has been shown for its dwell time with nothing new, cycle gentle idle phrases
+  // (Thinking… / Planning… / Waiting…) so the bar is alive but never overwrites a fresh message.
+  private startIdleCycle(token: number, dwellMs: number) {
+    this.idleTimer = setTimeout(() => {
+      if (token !== this.sayToken || !this.sayText) return;
+      // Pick a random phrase that isn't the one we just showed.
+      const n = AgentFx.IDLE_PHRASES.length;
+      let next = Math.floor(Math.random() * n);
+      if (next === this.idleIdx) next = (next + 1) % n;
+      this.idleIdx = next;
+      const phrase = AgentFx.IDLE_PHRASES[next];
+      // type the idle phrase, then rotate again after a short pause (~4s)
+      void this._type(phrase, token).then(() => {
+        if (token === this.sayToken) this.startIdleCycle(token, 4000);
+      });
+    }, dwellMs);
+  }
+
+  // Low-level typer shared by say() and the idle cycle. Fast: ~12ms/char (NOT floored by ms()),
+  // and types 2 chars per tick so even long lines finish quickly.
+  private async _type(msg: string, token: number) {
+    if (!this.sayText) return;
+    this.sayText.textContent = '';
+    const per = Math.max(6, Math.round(12 / (this.getPrefs().speed || 1)));
+    const step = msg.length > 60 ? 3 : 2; // bigger chunks for long messages
+    for (let i = step; i < msg.length + step; i += step) {
+      if (token !== this.sayToken) return;
+      this.sayText.textContent = msg.slice(0, Math.min(i, msg.length));
+      if (i < msg.length) await new Promise((r) => setTimeout(r, per));
+    }
+  }
+
+  // Retype the status bar's text. The bar STAYS visible. A message is held for at least
+  // MIN_DWELL_MS (~10s); if nothing new arrives, idle phrases start cycling. `dwellMs` overrides.
+  // `kind` swaps the leading icon: action ✦ | thinking 💭 | code ⌘ (checking code) | net ⇅.
+  async say(text: string, dwellMs?: number, kind: string = 'action') {
+    const box = this.ensureSayBox();
+    if (!box || !this.sayText) return;
+    box.style.opacity = '1';
+    if (this.sayDot) {
+      const icon = kind === 'thinking' ? '💭' : kind === 'code' ? '⌘' : kind === 'net' ? '⇅' : '✦';
+      this.sayDot.textContent = icon;
+      this.sayDot.style.color = kind === 'code' ? '#34d399' : kind === 'net' ? '#fbbf24' : '#a78bfa';
+    }
+    const msg = (text || '').trim() || 'Working…';
+    const token = ++this.sayToken;
+    this.clearTimers();
+    await this._type(msg, token);
+    if (token !== this.sayToken) return;
+    // Hold this message at least the dwell time before idle phrases take over.
+    this.startIdleCycle(token, Math.max(1000, dwellMs ?? AgentFx.MIN_DWELL_MS));
+  }
+
+  // Before an action runs: travel the cursor to the target, THEN spotlight it (so the motion reads).
+  async before(cmd: Command) {
+    const sel = cmd.args?.selector as string | undefined;
+    const rect = this.rectOf(sel);
+    if (rect) {
+      // 1) show the cursor where it currently is, 2) glide it to the target (visible travel),
+      // 3) light up the spotlight + tooltip on arrival.
+      this.ensureCursor();
+      await this.moveTo(rect.left + rect.width / 2, rect.top + rect.height / 2);
+      this.spotlight(rect, actionLabel(cmd));
+      if (cmd.op === 'click') this.ripple();
+      // Hold a beat so the human registers the spotlight before the action fires.
+      await new Promise((r) => setTimeout(r, this.ms(300)));
+    }
+    // For selector-less ops (navigate/reload/snapshot/etc) the narration toast (say) already shows.
+  }
+
+  after(_cmd: Command) {
+    // Let the spotlight linger so it's clearly visible, then fade.
+    setTimeout(() => this.clearSpotlight(), this.ms(1400));
+  }
+
+  fail(cmd: Command) {
+    if (this.tip) {
+      this.tip.style.background = '#ef4444';
+      this.tip.textContent = `failed: ${actionLabel(cmd)}`;
+    }
+    setTimeout(() => this.clearSpotlight(), this.ms(1100));
+  }
+
+  // Typewriter fill: set the input value one character at a time (each a real React-visible change),
+  // updating the spotlight label as it goes. Falls back to instant if the element vanishes.
+  async typeFill(selector: string, value: string): Promise<unknown> {
+    const node = document.querySelector(selector) as HTMLElement | null;
+    if (!node) throw new Error(`No element matches selector: ${selector}`);
+    const tag = node.tagName.toLowerCase();
+    const type = tag === 'input' ? ((node as HTMLInputElement).type || 'text').toLowerCase() : tag;
+    const isTextLike =
+      (tag === 'input' && !['checkbox', 'radio', 'date', 'datetime-local', 'time', 'month', 'week', 'file', 'range', 'color'].includes(type)) ||
+      tag === 'textarea' ||
+      (node as HTMLElement).isContentEditable;
+
+    // Non-text controls (select, checkbox, radio, date…): no char animation — set + brief label.
+    if (!isTextLike) {
+      const detail = setControlValue(node, value);
+      if (this.tip) this.tip.textContent = detail;
+      return { filled: selector, value, detail };
+    }
+
+    // Text-like: animate the typewriter (contenteditable uses textContent, others use value setter).
+    node.focus();
+    const editable = (node as HTMLElement).isContentEditable;
+    const setVal = (v: string) => {
+      if (editable) {
+        (node as HTMLElement).textContent = v;
+        node.dispatchEvent(new InputEvent('input', { bubbles: true }));
+      } else {
+        nativeSet(node, 'value', v);
+        node.dispatchEvent(new Event('input', { bubbles: true }));
+      }
+    };
+    // Pace: ~22ms/char (NOT floored by ms()), scaled by speed, so typing is snappy.
+    const per = Math.max(8, Math.round(22 / (this.getPrefs().speed || 1)));
+    const max = Math.min(value.length, 60);
+    for (let i = 1; i <= value.length; i++) {
+      setVal(value.slice(0, i));
+      if (this.tip) this.tip.textContent = `Typing "${value.slice(0, Math.min(i, 24))}${i > 24 ? '…' : ''}"`;
+      if (i <= max) await new Promise((r) => setTimeout(r, per));
+    }
+    node.dispatchEvent(new Event('change', { bubbles: true }));
+    return { filled: selector, value };
+  }
+
+  // fill_form: fill an array of {selector,value} one-by-one, animating each like a person —
+  // cursor glides to the field, spotlight, fast typewriter — in a single round-trip.
+  async fillForm(fields: Array<{ selector: string; value: string }>, narration?: string) {
+    const results: Array<{ selector: string; ok: boolean; value?: string; error?: string }> = [];
+    for (let i = 0; i < fields.length; i++) {
+      const f = fields[i];
+      if (!f || !f.selector) {
+        results.push({ selector: String(f?.selector), ok: false, error: 'missing selector' });
+        continue;
+      }
+      // Narrate progress on the bar (unless the agent gave its own message).
+      const hint = fieldHint(f.selector);
+      this.say(narration || `Filling ${hint || 'field ' + (i + 1)} (${i + 1}/${fields.length})`, undefined, 'action');
+      const node = document.querySelector(f.selector) as HTMLElement | null;
+      if (!node) {
+        results.push({ selector: f.selector, ok: false, error: 'no element matches selector' });
+        continue;
+      }
+      const rect = (node.scrollIntoView({ block: 'center', behavior: 'smooth' }), node.getBoundingClientRect());
+      this.ensureCursor();
+      await this.moveTo(rect.left + rect.width / 2, rect.top + rect.height / 2);
+      this.spotlight(rect, `Typing "${String(f.value).slice(0, 24)}"`);
+      try {
+        await this.typeFill(f.selector, String(f.value ?? ''));
+        results.push({ selector: f.selector, ok: true, value: String(f.value ?? '') });
+      } catch (e) {
+        results.push({ selector: f.selector, ok: false, error: e instanceof Error ? e.message : String(e) });
+      }
+      // Brief pause between fields so the motion reads as deliberate.
+      await new Promise((r) => setTimeout(r, this.ms(180)));
+    }
+    setTimeout(() => this.clearSpotlight(), this.ms(800));
+    const filled = results.filter((r) => r.ok).length;
+    return { filledForm: true, total: fields.length, filled, results };
+  }
+}
+
+// Human-readable label for the spotlight tooltip.
+function actionLabel(cmd: Command): string {
+  const a = cmd.args || {};
+  switch (cmd.op) {
+    case 'click':
+      return `Clicking ${fieldHint(a.selector) || shortSel(a.selector)}`;
+    case 'fill':
+      return `Typing "${String(a.value).slice(0, 24)}"${fieldHint(a.selector) ? ' in ' + fieldHint(a.selector) : ''}`;
+    case 'fill_form':
+      return `Filling the form (${Array.isArray(a.fields) ? (a.fields as unknown[]).length : 0} fields)`;
+    case 'navigate':
+      return `Going to ${String(a.url)}`;
+    case 'reload':
+      return a.hard ? 'Hard-reloading the page' : 'Reloading the page';
+    case 'snapshot':
+      return 'Reading the page';
+    case 'page_context':
+      return 'Checking where I am';
+    case 'overview':
+      return 'Scanning the page layout';
+    case 'find':
+      return `Searching for "${String(a.query).slice(0, 30)}"`;
+    case 'components':
+      return 'Inspecting the React components';
+    case 'component_for':
+      return 'Finding the component for this element';
+    case 'rerender':
+      return 'Forcing a re-render';
+    case 'wait_for':
+      return a.text ? `Waiting for "${String(a.text).slice(0, 30)}" to appear` : 'Waiting for the page to update';
+    case 'network_calls':
+      return 'Checking network requests';
+    case 'storage':
+      return `Reading ${String(a.area || 'local')} storage`;
+    case 'cache':
+      return 'Inspecting the cache';
+    case 'eval':
+      return 'Running a quick check in the page';
+    case 'screenshot':
+      return 'Taking a screenshot';
+    case 'open_tab':
+      return `Opening a new tab (${String(a.url)})`;
+    default:
+      return 'Working…';
+  }
+}
+
+// Best-effort human name for a target element (label/placeholder/name/text) for nicer narration.
+function fieldHint(sel: unknown): string {
+  try {
+    const el = sel ? (document.querySelector(String(sel)) as HTMLElement | null) : null;
+    if (!el) return '';
+    const name =
+      labelFor(el) ||
+      (el as HTMLInputElement).placeholder ||
+      el.getAttribute('name') ||
+      (el.textContent || '').trim();
+    return name ? `"${name.slice(0, 28)}"` : '';
+  } catch {
+    return '';
+  }
+}
+function shortSel(sel: unknown): string {
+  const s = String(sel ?? '');
+  return s.length > 28 ? s.slice(0, 28) + '…' : s;
+}
+
+// ---- HUD (visible control panel) -------------------------------------------
+
+function Hud(props: {
+  status: Status;
+  busy: boolean;
+  thinking: string | null;
+  paused: boolean;
+  tabId: string;
+  prefs: Prefs;
+  onTogglePause: () => void;
+  onToggleFx: () => void;
+  onToggleCollapsed: () => void;
+  onSpeed: (v: number) => void;
+  onMove: (pos: { x: number; y: number } | null) => void;
+}) {
+  const { status, busy, thinking, paused, prefs } = props;
   const color = status === 'connected' ? '#22c55e' : status === 'connecting' ? '#eab308' : '#ef4444';
   const label = status === 'connected' ? 'Agent connected' : status === 'connecting' ? 'Connecting…' : 'Agent offline';
+
+  const panelRef = useRef<HTMLDivElement | null>(null);
+  const drag = useRef<{ dx: number; dy: number } | null>(null);
+
+  // Drag the panel by its header. Clamps to the viewport; position persists via onMove.
+  const onHeaderPointerDown = (e: React.PointerEvent) => {
+    // Ignore drags that start on a control button.
+    if ((e.target as HTMLElement).closest('button,input,label')) return;
+    const el = panelRef.current;
+    if (!el) return;
+    const r = el.getBoundingClientRect();
+    drag.current = { dx: e.clientX - r.left, dy: e.clientY - r.top };
+    (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
+    e.preventDefault();
+  };
+  const onHeaderPointerMove = (e: React.PointerEvent) => {
+    if (!drag.current) return;
+    const w = panelRef.current?.offsetWidth || 320;
+    const h = panelRef.current?.offsetHeight || 120;
+    const x = Math.min(Math.max(0, e.clientX - drag.current.dx), window.innerWidth - w);
+    const y = Math.min(Math.max(0, e.clientY - drag.current.dy), window.innerHeight - h);
+    props.onMove({ x, y });
+  };
+  const onHeaderPointerUp = (e: React.PointerEvent) => {
+    drag.current = null;
+    try {
+      (e.currentTarget as HTMLElement).releasePointerCapture(e.pointerId);
+    } catch {
+      /* ignore */
+    }
+  };
+
+  // Positioned by saved pos, else anchored bottom-right.
+  const posStyle: React.CSSProperties = prefs.pos
+    ? { left: prefs.pos.x, top: prefs.pos.y }
+    : { bottom: 16, right: 16 };
+
+  const btn: React.CSSProperties = {
+    pointerEvents: 'auto',
+    cursor: 'pointer',
+    border: '1px solid #334155',
+    background: '#1e293b',
+    color: '#e2e8f0',
+    borderRadius: 6,
+    padding: '2px 7px',
+    font: '11px/1.2 ui-monospace, Menlo, monospace',
+  };
+
   return (
     <div
+      ref={panelRef}
       style={{
         position: 'fixed',
-        bottom: 16,
-        right: 16,
+        ...posStyle,
         zIndex: 2147483647,
         font: '12px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace',
         color: '#e5e7eb',
-        background: 'rgba(17,24,39,0.92)',
+        background: 'rgba(15,23,42,0.94)',
         border: `1px solid ${color}`,
-        borderRadius: 10,
-        padding: '8px 10px',
-        width: 280,
-        boxShadow: '0 8px 24px rgba(0,0,0,0.35)',
-        backdropFilter: 'blur(6px)',
-        pointerEvents: 'none',
+        borderRadius: 12,
+        padding: '9px 11px',
+        width: prefs.collapsed ? 200 : 320,
+        boxShadow: '0 10px 30px rgba(0,0,0,0.45)',
+        backdropFilter: 'blur(8px)',
         userSelect: 'none',
       }}
       data-agent-bridge-hud
     >
-      <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: feed.length ? 6 : 0 }}>
+      <div
+        onPointerDown={onHeaderPointerDown}
+        onPointerMove={onHeaderPointerMove}
+        onPointerUp={onHeaderPointerUp}
+        onDoubleClick={() => props.onMove(null)}
+        style={{ display: 'flex', alignItems: 'center', gap: 8, cursor: 'grab', pointerEvents: 'auto', touchAction: 'none' }}
+        title="Drag to move · double-click to reset position"
+      >
         <span
           style={{
             width: 9,
             height: 9,
             borderRadius: '50%',
             background: color,
-            boxShadow: busy ? `0 0 0 0 ${color}` : 'none',
             animation: busy ? 'agentPulse 1s infinite' : 'none',
           }}
         />
-        <strong style={{ color: '#fff', fontWeight: 600 }}>nextjs-agent</strong>
-        <span style={{ marginLeft: 'auto', color }}>{label}</span>
+        <strong style={{ color: '#fff', fontWeight: 700 }}>nextjs-agent</strong>
+        <span style={{ marginLeft: 'auto', color, fontSize: 11 }}>{label}</span>
+        <button style={btn} onClick={props.onToggleCollapsed} title="Expand/collapse">
+          {prefs.collapsed ? '▢' : '—'}
+        </button>
       </div>
-      <div style={{ color: '#6b7280', fontSize: 10, marginBottom: feed.length ? 6 : 0 }}>{TAB_ID}</div>
-      {feed.map((it) => (
-        <div key={it.id} style={{ display: 'flex', gap: 6, opacity: it.state === 'running' ? 1 : 0.7, marginTop: 3 }}>
-          <span style={{ width: 12 }}>{it.state === 'running' ? '▸' : it.state === 'ok' ? '✓' : '✗'}</span>
-          <span style={{ color: it.state === 'error' ? '#fca5a5' : '#93c5fd' }}>{it.op}</span>
-          <span style={{ color: '#9ca3af', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-            {it.detail}
-          </span>
+
+      <div style={{ color: '#64748b', fontSize: 10, marginTop: 3 }}>{props.tabId}</div>
+
+      {thinking && (
+        <div
+          style={{
+            marginTop: 7,
+            padding: '6px 8px',
+            borderRadius: 8,
+            background: 'linear-gradient(135deg,rgba(99,102,241,.25),rgba(139,92,246,.25))',
+            border: '1px solid rgba(139,92,246,.4)',
+            color: '#e9d5ff',
+            fontSize: 12,
+          }}
+        >
+          💭 {thinking}
         </div>
-      ))}
+      )}
+
+      {!prefs.collapsed && (
+        <>
+          <div style={{ display: 'flex', gap: 6, marginTop: 8, flexWrap: 'wrap', alignItems: 'center' }}>
+            <button style={{ ...btn, ...(paused ? { background: '#7c2d12', borderColor: '#9a3412' } : {}) }} onClick={props.onTogglePause}>
+              {paused ? '▶ Resume' : '⏸ Pause'}
+            </button>
+            <button style={{ ...btn, ...(prefs.fx ? { background: '#075985', borderColor: '#0369a1' } : {}) }} onClick={props.onToggleFx} title="Toggle fancy animations">
+              {prefs.fx ? '✨ FX on' : 'FX off'}
+            </button>
+            <label style={{ display: 'flex', alignItems: 'center', gap: 4, color: '#94a3b8', fontSize: 10, pointerEvents: 'auto' }}>
+              spd
+              <input
+                type="range"
+                min={0.5}
+                max={3}
+                step={0.5}
+                value={prefs.speed}
+                onChange={(e) => props.onSpeed(Number(e.target.value))}
+                style={{ width: 56, pointerEvents: 'auto' }}
+              />
+            </label>
+          </div>
+        </>
+      )}
+
       <style>{`@keyframes agentPulse{0%{box-shadow:0 0 0 0 ${color}80}70%{box-shadow:0 0 0 6px ${color}00}100%{box-shadow:0 0 0 0 ${color}00}}
-        @keyframes agentRing{0%{box-shadow:0 0 0 2px #38bdf8,0 0 0 6px #38bdf855}100%{box-shadow:0 0 0 2px #38bdf800,0 0 0 14px #38bdf800}}`}</style>
+        @keyframes agentRipple{0%{width:10px;height:10px;opacity:.65}100%{width:80px;height:80px;opacity:0}}
+        @keyframes agentCursorPulse{0%{transform:scale(.6);opacity:.8}100%{transform:scale(2.2);opacity:0}}
+        @keyframes agentSpotPulse{0%,100%{box-shadow:0 0 0 3px #38bdf8,0 0 0 100000px rgba(2,6,23,.6),0 0 26px 4px rgba(56,189,248,.7)}50%{box-shadow:0 0 0 4px #7dd3fc,0 0 0 100000px rgba(2,6,23,.62),0 0 40px 10px rgba(56,189,248,.95)}}
+        @keyframes agentCaret{0%,100%{opacity:1}50%{opacity:0}}
+        @keyframes agentThink{0%,100%{opacity:.5;transform:rotate(0deg)}50%{opacity:1;transform:rotate(180deg)}}`}</style>
     </div>
   );
-}
-
-// Briefly outline the element an action targets, so the user can see WHERE the agent acted.
-function highlight(cmd: Command) {
-  const sel = cmd.args?.selector as string | undefined;
-  if (!sel) return;
-  const node = document.querySelector(sel) as HTMLElement | null;
-  if (!node) return;
-  const prev = node.style.animation;
-  node.style.animation = 'agentRing 0.8s ease-out';
-  setTimeout(() => {
-    node.style.animation = prev;
-  }, 800);
-}
-
-function describe(cmd: Command): string {
-  const a = cmd.args || {};
-  if (cmd.op === 'fill') return `${a.selector} = "${String(a.value).slice(0, 20)}"`;
-  if (cmd.op === 'navigate') return String(a.url);
-  if (cmd.op === 'wait_for') return (a.selector as string) || (a.text ? `text:"${a.text}"` : '');
-  if (cmd.op === 'snapshot') return 'reading page…';
-  if (cmd.op === 'page_context') return location.pathname;
-  if (cmd.op === 'open_tab') return `open ${String(a.url)}`;
-  if (cmd.op === 'reload') return a.hard ? 'hard reload' : 'reload';
-  if (cmd.op === 'network_calls') return Array.isArray(a.types) ? (a.types as string[]).join(',') : 'all calls';
-  if (cmd.op === 'storage') return `${a.area || 'local'} ${a.action || 'get'}${a.key ? ' ' + a.key : ''}`;
-  if (cmd.op === 'cache') return `cache ${a.action || 'list'}`;
-  if (cmd.op === 'eval') return String(a.code).slice(0, 28);
-  if (cmd.op === 'screenshot') return 'capturing…';
-  if (cmd.op === 'find') return `find "${String(a.query)}"`;
-  if (cmd.op === 'overview') return 'page overview…';
-  if (a.selector) return String(a.selector);
-  return '';
 }
 
 // ---- op implementations (run in the page) ---------------------------------
@@ -417,6 +1187,19 @@ async function run(op: string, args: Record<string, unknown>): Promise<unknown> 
       return doClick(String(args.selector));
     case 'fill':
       return doFill(String(args.selector), String(args.value ?? ''));
+    case 'fill_form': {
+      // Non-animated batch fill (used when FX is off). Fills every field instantly.
+      const fields = (args.fields as Array<{ selector: string; value: string }>) || [];
+      const results = fields.map((f) => {
+        try {
+          doFill(String(f.selector), String(f.value ?? ''));
+          return { selector: f.selector, ok: true };
+        } catch (e) {
+          return { selector: f.selector, ok: false, error: e instanceof Error ? e.message : String(e) };
+        }
+      });
+      return { filledForm: true, total: fields.length, filled: results.filter((r) => r.ok).length, results };
+    }
     case 'snapshot':
       return doSnapshot();
     case 'page_context':
@@ -709,17 +1492,117 @@ function doClick(selector: string) {
   return { clicked: selector };
 }
 
+// Set a value on a control using the right strategy for its type. Returns a short describing string.
+// Handles: <select> (by value OR visible label), checkbox/radio (true/false/on/off/1/0/value match),
+// date/time (normalizes common formats), number/text/textarea (native value setter), contenteditable.
+function setControlValue(node: HTMLElement, value: string): string {
+  const tag = node.tagName.toLowerCase();
+
+  // <select> — match by option value first, else by visible label (case-insensitive).
+  if (tag === 'select') {
+    const sel = node as HTMLSelectElement;
+    const opts = Array.from(sel.options);
+    let opt =
+      opts.find((o) => o.value === value) ||
+      opts.find((o) => o.text.trim().toLowerCase() === value.trim().toLowerCase()) ||
+      opts.find((o) => o.text.trim().toLowerCase().includes(value.trim().toLowerCase()));
+    if (!opt) throw new Error(`No <option> matching "${value}" (have: ${opts.map((o) => o.text.trim()).slice(0, 8).join(', ')})`);
+    nativeSet(sel, 'value', opt.value);
+    sel.dispatchEvent(new Event('input', { bubbles: true }));
+    sel.dispatchEvent(new Event('change', { bubbles: true }));
+    return `selected "${opt.text.trim()}"`;
+  }
+
+  if (tag === 'input') {
+    const input = node as HTMLInputElement;
+    const type = (input.type || 'text').toLowerCase();
+
+    if (type === 'checkbox') {
+      const want = /^(true|1|on|yes|checked)$/i.test(value.trim());
+      if (input.checked !== want) input.click(); // click fires the right React/MUI events
+      return `checkbox ${input.checked ? 'checked' : 'unchecked'}`;
+    }
+    if (type === 'radio') {
+      // Select the radio in the group whose value/label matches; if this exact one, just click it.
+      const group = input.name
+        ? (Array.from(document.querySelectorAll(`input[type="radio"][name="${CSS.escape(input.name)}"]`)) as HTMLInputElement[])
+        : [input];
+      const target =
+        group.find((r) => r.value === value) ||
+        group.find((r) => (r.labels?.[0]?.textContent || '').trim().toLowerCase() === value.trim().toLowerCase()) ||
+        input;
+      if (!target.checked) target.click();
+      return `radio "${target.value}" selected`;
+    }
+    if (type === 'date' || type === 'datetime-local' || type === 'time' || type === 'month' || type === 'week') {
+      const v = normalizeDateValue(type, value);
+      nativeSet(input, 'value', v);
+      input.dispatchEvent(new Event('input', { bubbles: true }));
+      input.dispatchEvent(new Event('change', { bubbles: true }));
+      return `set ${type} to "${v}"`;
+    }
+    if (type === 'file') {
+      throw new Error('file inputs cannot be set programmatically (OS picker); use the upload tool path');
+    }
+    // text-like inputs (text, email, number, search, tel, url, password…)
+    nativeSet(input, 'value', value);
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+    input.dispatchEvent(new Event('change', { bubbles: true }));
+    return `typed "${value}"`;
+  }
+
+  if (tag === 'textarea') {
+    nativeSet(node as HTMLTextAreaElement, 'value', value);
+    node.dispatchEvent(new Event('input', { bubbles: true }));
+    node.dispatchEvent(new Event('change', { bubbles: true }));
+    return `typed "${value}"`;
+  }
+
+  // contenteditable (rich text / editable divs)
+  if ((node as HTMLElement).isContentEditable) {
+    node.focus();
+    (node as HTMLElement).textContent = value;
+    node.dispatchEvent(new InputEvent('input', { bubbles: true }));
+    return `set contenteditable text`;
+  }
+
+  throw new Error(`Don't know how to fill <${tag}> — not a known input type`);
+}
+
+// Set a property via the element's native prototype setter so React's value-shadowing is bypassed.
+function nativeSet(node: HTMLElement, prop: 'value', v: string) {
+  const tag = node.tagName.toLowerCase();
+  const proto =
+    tag === 'select'
+      ? HTMLSelectElement.prototype
+      : tag === 'textarea'
+        ? HTMLTextAreaElement.prototype
+        : HTMLInputElement.prototype;
+  const setter = Object.getOwnPropertyDescriptor(proto, prop)?.set;
+  if (setter) setter.call(node, v);
+  else (node as unknown as Record<string, string>)[prop] = v;
+}
+
+// Best-effort normalization for native date/time inputs (they require specific value formats).
+function normalizeDateValue(type: string, value: string): string {
+  const v = value.trim();
+  if (type === 'time') return v; // expects HH:MM (24h)
+  // Accept yyyy-mm-dd as-is; try to coerce other parseable dates.
+  if (/^\d{4}-\d{2}-\d{2}/.test(v)) return type === 'datetime-local' ? v.replace(' ', 'T').slice(0, 16) : v.slice(0, type === 'month' ? 7 : 10);
+  const d = new Date(v);
+  if (isNaN(d.getTime())) return v; // leave as-is; let the input reject if invalid
+  const pad = (n: number) => String(n).padStart(2, '0');
+  const ymd = `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+  if (type === 'month') return ymd.slice(0, 7);
+  if (type === 'datetime-local') return `${ymd}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+  return ymd;
+}
+
 function doFill(selector: string, value: string) {
-  const node = el(selector) as HTMLInputElement | HTMLTextAreaElement;
-  const proto = node instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
-  const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
+  const node = el(selector);
   node.focus();
-  // The native setter bypasses React's value-shadowing so the 'input' event is treated as a real change.
-  if (setter) setter.call(node, value);
-  else node.value = value;
-  node.dispatchEvent(new Event('input', { bubbles: true }));
-  node.dispatchEvent(new Event('change', { bubbles: true }));
-  return { filled: selector, value };
+  const detail = setControlValue(node, value);
+  return { filled: selector, value, detail };
 }
 
 function cssPath(node: Element): string {

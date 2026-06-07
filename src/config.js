@@ -9,10 +9,13 @@ export function loadConfig(argv = process.argv.slice(2)) {
     const a = argv[i];
     if (a === '--project') opts.project = argv[++i];
     else if (a === '--ws-port') opts.wsPort = Number(argv[++i]);
+    else if (a === '--http-port') opts.httpPort = Number(argv[++i]);
   }
 
   const project = resolve(opts.project || process.env.NEXTJS_MCP_PROJECT || process.cwd());
   const wsPort = opts.wsPort || Number(process.env.NEXTJS_MCP_WS_PORT) || 7333;
+  // Optional local HTTP control endpoint (debug/automation): POST /op {op,args,tabId}. Off unless set.
+  const httpPort = opts.httpPort || Number(process.env.NEXTJS_MCP_HTTP_PORT) || 0;
 
-  return { project, wsPort };
+  return { project, wsPort, httpPort };
 }

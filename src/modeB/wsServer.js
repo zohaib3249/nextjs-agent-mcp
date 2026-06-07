@@ -6,37 +6,51 @@
 import { WebSocketServer } from 'ws';
 
 export class BridgeServer {
-  constructor({ port, exitOnBindError = true }) {
+  constructor({ port, portRange = 11 }) {
+    this.basePort = port;
     this.port = port;
-    this.exitOnBindError = exitOnBindError;
+    this.portRange = portRange; // how many ports to try if the base is busy (port..port+range-1)
     this.wss = null;
     this.clients = new Set(); // active bridge sockets, newest last
     this.pending = new Map(); // commandId -> { resolve, reject, timer }
     this.consoleLog = []; // forwarded browser console errors
     this._seq = 0;
-    this.bindError = null; // set if the port could not be bound (e.g. EADDRINUSE)
+    this.bindError = null; // set if NO port in the range could be bound
+    this.activeTabId = null; // sticky "current" tab; tab-aware tools default to it when set
   }
 
+  // Try the base port; if busy, auto-advance through the range until one binds. The bridge in the
+  // browser scans the same range, so a shifted port still connects (no manual --ws-port juggling).
   start() {
     if (this.wss) return { alreadyRunning: true, port: this.port };
-    const wss = new WebSocketServer({ port: this.port });
-    // CRITICAL: surface bind failures. Two MCP instances on the same --ws-port collide here;
-    // without this the bridge silently never listens and every tool reports "no tab connected".
+    this._tryBind(this.basePort, 0);
+    return { started: true, port: this.port, basePort: this.basePort };
+  }
+
+  _tryBind(port, attempt) {
+    const wss = new WebSocketServer({ port });
     wss.on('error', (e) => {
-      if (e && e.code === 'EADDRINUSE') {
-        this.bindError = `Port ${this.port} already in use — another nextjs-agent MCP is likely running on this --ws-port. ` +
-          `Stop the other instance or pass a different --ws-port (and set NEXT_PUBLIC_AGENT_BRIDGE_PORT to match).`;
+      if (e && e.code === 'EADDRINUSE' && attempt < this.portRange - 1) {
+        const next = port + 1;
+        console.error(`[bridge] port ${port} busy — trying ${next}…`);
+        try {
+          wss.close();
+        } catch {
+          /* ignore */
+        }
+        this._tryBind(next, attempt + 1);
+      } else if (e && e.code === 'EADDRINUSE') {
+        this.bindError = `No free WS port in ${this.basePort}–${this.basePort + this.portRange - 1}. Close other instances.`;
         console.error('[bridge] ' + this.bindError);
         this.wss = null;
-        // Fail fast: a second instance with a dead bridge is useless and confusing. Exit so the
-        // launcher (IDE / MCP host) clearly reports a failed start instead of a half-alive server.
-        if (this.exitOnBindError) {
-          console.error('[bridge] exiting because the WS port is unavailable.');
-          process.exit(1);
-        }
       } else {
         console.error('[bridge] ws error:', e && e.message);
       }
+    });
+    wss.on('listening', () => {
+      this.port = port;
+      this.bindError = null;
+      if (port !== this.basePort) console.error(`[bridge] listening on auto-selected port ${port} (base ${this.basePort} was busy)`);
     });
     wss.on('connection', (ws) => {
       this.clients.add(ws);
@@ -46,7 +60,7 @@ export class BridgeServer {
       ws.on('error', () => this.clients.delete(ws));
     });
     this.wss = wss;
-    return { started: true, port: this.port };
+    this.port = port;
   }
 
   _onMessage(ws, raw) {
@@ -57,7 +71,20 @@ export class BridgeServer {
       return;
     }
     if (msg.kind === 'hello') {
-      ws.meta.tabId = msg.tabId || ws.meta.tabId;
+      // De-dupe: if another OPEN socket already claims this tabId (e.g. tabs that inherited the
+      // same sessionStorage/window.name via duplicate-tab), assign this one a fresh unique id and
+      // tell the bridge to adopt it. Guarantees every connected tab has a distinct tabId.
+      let tabId = msg.tabId || ws.meta.tabId || this._mkTabId();
+      if (this._tabIdInUse(tabId, ws)) {
+        const fresh = this._mkTabId();
+        tabId = fresh;
+        try {
+          ws.send(JSON.stringify({ kind: 'assignTabId', tabId: fresh }));
+        } catch {
+          /* ignore */
+        }
+      }
+      ws.meta.tabId = tabId;
       ws.meta.url = msg.url;
       ws.meta.pathname = msg.pathname || null;
       ws.meta.title = msg.title || null;
@@ -81,10 +108,28 @@ export class BridgeServer {
     return [...this.clients].filter((w) => w.readyState === w.OPEN);
   }
 
-  // Resolve a target socket: by explicit tabId, else most-recently-connected open socket.
+  // Is this tabId already claimed by a different open socket?
+  _tabIdInUse(tabId, exceptWs) {
+    return this._openClients().some((w) => w !== exceptWs && w.meta.tabId === tabId);
+  }
+
+  // Server-generated unique tab id (collision-checked).
+  _mkTabId() {
+    let id;
+    do {
+      id = 'tab-' + Math.random().toString(36).slice(2, 10) + (++this._seq).toString(36);
+    } while (this._tabIdInUse(id, null));
+    return id;
+  }
+
+  // Resolve a target socket. Priority: explicit tabId → sticky active tab → most-recently-connected.
   _target(tabId) {
     const open = this._openClients();
     if (tabId) return open.find((w) => w.meta.tabId === tabId) || null;
+    if (this.activeTabId) {
+      const active = open.find((w) => w.meta.tabId === this.activeTabId);
+      if (active) return active;
+    }
     return open.length ? open[open.length - 1] : null;
   }
 
@@ -92,10 +137,41 @@ export class BridgeServer {
     return { tabId: ws.meta.tabId, url: ws.meta.url, pathname: ws.meta.pathname, title: ws.meta.title, userAgent: ws.meta.userAgent };
   }
 
+  // The effective default tab id (active if set & still connected, else most-recent).
+  _defaultTabId() {
+    const ws = this._target(null);
+    return ws ? ws.meta.tabId : null;
+  }
+
   // List every connected tab (id + url + title). Most-recent last.
   listTabs() {
     const tabs = this._openClients().map((w) => this.tabInfo(w));
-    return { count: tabs.length, defaultTabId: tabs.length ? tabs[tabs.length - 1].tabId : null, tabs };
+    return { count: tabs.length, activeTabId: this.activeTabId, defaultTabId: this._defaultTabId(), tabs };
+  }
+
+  // Report the current/active tab (what tab-aware tools target by default).
+  currentTab() {
+    const ws = this._target(null);
+    return {
+      activeTabId: this.activeTabId,
+      defaultTabId: this._defaultTabId(),
+      sticky: !!this.activeTabId,
+      tab: ws ? this.tabInfo(ws) : null,
+    };
+  }
+
+  // Set the sticky active tab. Pass null to clear (revert to most-recent). Returns the new state.
+  setActiveTab(tabId) {
+    if (tabId === null || tabId === undefined) {
+      this.activeTabId = null;
+      return { ok: true, cleared: true, ...this.currentTab() };
+    }
+    const exists = this._openClients().some((w) => w.meta.tabId === tabId);
+    if (!exists) {
+      return { ok: false, error: `No connected tab with tabId "${tabId}". Call list_tabs to see connected tabs.` };
+    }
+    this.activeTabId = tabId;
+    return { ok: true, ...this.currentTab() };
   }
 
   status() {
@@ -107,10 +183,11 @@ export class BridgeServer {
     };
   }
 
-  // Low-level: send one op to one socket and await its result.
-  _send(ws, op, args, timeoutMs) {
+  // Low-level: send one op to one socket and await its result. `message` (optional) is the agent's
+  // human-readable narration for this call; the bridge types it into the on-page toast.
+  _send(ws, op, args, timeoutMs, message) {
     const id = ++this._seq;
-    const frame = JSON.stringify({ kind: 'command', id, op, args });
+    const frame = JSON.stringify({ kind: 'command', id, op, args, message: message || null });
     return new Promise((resolve) => {
       const timer = setTimeout(() => {
         this.pending.delete(id);
@@ -129,14 +206,14 @@ export class BridgeServer {
 
   // Send an op to the target tab (or a specific tabId) and await its result.
   // Pass { all: true } to broadcast to every connected tab and get an array of per-tab results.
-  async dispatch(op, args = {}, { timeoutMs = 10000, tabId = null, all = false } = {}) {
+  async dispatch(op, args = {}, { timeoutMs = 10000, tabId = null, all = false, message = null } = {}) {
     if (this.bindError) return { ok: false, error: this.bindError };
 
     if (all) {
       const open = this._openClients();
       if (!open.length) return { ok: false, error: this._noTabMsg() };
       const results = await Promise.all(
-        open.map(async (ws) => ({ tabId: ws.meta.tabId, ...(await this._send(ws, op, args, timeoutMs)) }))
+        open.map(async (ws) => ({ tabId: ws.meta.tabId, ...(await this._send(ws, op, args, timeoutMs, message)) }))
       );
       return { ok: true, value: { broadcast: true, count: results.length, results } };
     }
@@ -150,7 +227,7 @@ export class BridgeServer {
           : this._noTabMsg(),
       };
     }
-    return this._send(ws, op, args, timeoutMs);
+    return this._send(ws, op, args, timeoutMs, message);
   }
 
   _noTabMsg() {

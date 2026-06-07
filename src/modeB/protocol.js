@@ -14,6 +14,7 @@
 export const OPS = Object.freeze({
   CLICK: 'click',
   FILL: 'fill',
+  FILL_FORM: 'fill_form',
   SNAPSHOT: 'snapshot',
   PAGE_CONTEXT: 'page_context',
   OVERVIEW: 'overview',
@@ -30,6 +31,8 @@ export const OPS = Object.freeze({
   EVAL: 'eval',
   SCREENSHOT: 'screenshot',
   FIND: 'find',
+  THINK: 'think',
+  STATUS: 'status',
 });
 
 export const DEFAULT_WS_PORT = 7333;

@@ -1,23 +1,40 @@
 'use client';
+var __defProp = Object.defineProperty;
+var __defNormalProp = (obj, key, value) => key in obj ? __defProp(obj, key, { enumerable: true, configurable: true, writable: true, value }) : obj[key] = value;
+var __publicField = (obj, key, value) => __defNormalProp(obj, typeof key !== "symbol" ? key + "" : key, value);
 
 // bridge/src/agent-bridge.client.tsx
-import { useEffect, useState } from "react";
-import { jsx, jsxs } from "react/jsx-runtime";
+import { useEffect, useRef, useState } from "react";
+import { Fragment, jsx, jsxs } from "react/jsx-runtime";
 var WS_PORT = Number(process.env.NEXT_PUBLIC_AGENT_BRIDGE_PORT) || 7333;
+var WS_PORT_RANGE = 11;
+function rand() {
+  try {
+    const a = new Uint32Array(2);
+    crypto.getRandomValues(a);
+    return a[0].toString(36) + a[1].toString(36);
+  } catch {
+    return Math.random().toString(36).slice(2) + Math.random().toString(36).slice(2);
+  }
+}
 function getTabId() {
   try {
-    const k = "__agent_bridge_tab_id";
-    let v = sessionStorage.getItem(k);
-    if (!v) {
-      v = "tab-" + Math.random().toString(36).slice(2, 8) + "-" + Date.now() % 1e5;
-      sessionStorage.setItem(k, v);
-    }
-    return v;
+    if (window.name && window.name.startsWith("agbid:")) return window.name.slice(6);
+    const id = "tab-" + rand().slice(0, 10);
+    window.name = "agbid:" + id;
+    return id;
   } catch {
-    return "tab-" + Math.random().toString(36).slice(2, 8);
+    return "tab-" + rand().slice(0, 10);
   }
 }
 var TAB_ID = typeof window !== "undefined" ? getTabId() : "tab-ssr";
+function adoptTabId(id) {
+  TAB_ID = id;
+  try {
+    window.name = "agbid:" + id;
+  } catch {
+  }
+}
 var NET = {
   seq: 0,
   entries: [],
@@ -141,32 +158,95 @@ function installNetworkRecorder() {
   }
 }
 if (typeof window !== "undefined") installNetworkRecorder();
+var PREFS_KEY = "__agent_bridge_prefs";
+var DEFAULT_PREFS = { fx: true, collapsed: false, speed: 1, pos: null };
+function loadPrefs() {
+  try {
+    return { ...DEFAULT_PREFS, ...JSON.parse(localStorage.getItem(PREFS_KEY) || "{}") };
+  } catch {
+    return DEFAULT_PREFS;
+  }
+}
+function savePrefs(p) {
+  try {
+    localStorage.setItem(PREFS_KEY, JSON.stringify(p));
+  } catch {
+  }
+}
+var FX = null;
 function AgentBridge() {
   const [status, setStatus] = useState("connecting");
-  const [feed, setFeed] = useState([]);
   const [busy, setBusy] = useState(false);
+  const [thinking, setThinking] = useState(null);
+  const [paused, setPaused] = useState(false);
+  const [tabIdState, setTabIdState] = useState(TAB_ID);
+  const [prefs, setPrefs] = useState(DEFAULT_PREFS);
+  const [mounted, setMounted] = useState(false);
+  useEffect(() => {
+    setPrefs(loadPrefs());
+    setMounted(true);
+  }, []);
+  const fxLayer = useRef(null);
+  const pausedRef = useRef(paused);
+  const prefsRef = useRef(prefs);
+  const resumeWaiters = useRef([]);
+  pausedRef.current = paused;
+  prefsRef.current = prefs;
+  useEffect(() => {
+    if (mounted) savePrefs(prefs);
+  }, [prefs, mounted]);
+  useEffect(() => {
+    if (!paused) {
+      const w = resumeWaiters.current;
+      resumeWaiters.current = [];
+      w.forEach((r) => r());
+    }
+  }, [paused]);
+  useEffect(() => {
+    FX = new AgentFx(() => fxLayer.current, () => prefsRef.current);
+    const t = setTimeout(() => {
+      if (prefsRef.current.fx) FX?.showBar(status === "connected" ? "Agent connected \u2014 ready" : "Waiting for the agent\u2026");
+    }, 50);
+    return () => {
+      clearTimeout(t);
+      FX = null;
+    };
+  }, []);
+  useEffect(() => {
+    if (!FX) return;
+    if (!prefs.fx) FX.hideBar();
+    else FX.showBar(status === "connected" ? "Agent connected \u2014 ready" : status === "connecting" ? "Connecting\u2026" : "Agent offline");
+  }, [status, prefs.fx]);
   useEffect(() => {
     let ws = null;
     let closed = false;
     let retry = null;
-    let feedSeq = 0;
-    const pushFeed = (op, detail) => {
-      const fid = ++feedSeq;
-      const item = { id: fid, op, detail, state: "running", ts: Date.now() };
-      setFeed((f) => [item, ...f].slice(0, 8));
-      return fid;
-    };
-    const settleFeed = (fid, state) => setFeed((f) => f.map((it) => it.id === fid ? { ...it, state } : it));
+    const waitWhilePaused = () => pausedRef.current ? new Promise((r) => resumeWaiters.current.push(r)) : Promise.resolve();
+    let portOffset = 0;
     const connect = () => {
       if (closed) return;
       setStatus("connecting");
+      const port = WS_PORT + portOffset % WS_PORT_RANGE;
+      let opened = false;
       try {
-        ws = new WebSocket(`ws://localhost:${WS_PORT}`);
+        ws = new WebSocket(`ws://localhost:${port}`);
       } catch {
-        retry = setTimeout(connect, 1500);
+        portOffset++;
+        retry = setTimeout(connect, 400);
         return;
       }
+      const tryNext = setTimeout(() => {
+        if (!opened) {
+          portOffset++;
+          try {
+            ws?.close();
+          } catch {
+          }
+        }
+      }, 700);
       ws.onopen = () => {
+        opened = true;
+        clearTimeout(tryNext);
         setStatus("connected");
         ws.send(
           JSON.stringify({
@@ -178,6 +258,7 @@ function AgentBridge() {
             userAgent: navigator.userAgent
           })
         );
+        if (prefsRef.current.fx) FX?.showBar("Agent connected \u2014 ready");
       };
       ws.onmessage = async (ev) => {
         let cmd;
@@ -186,25 +267,69 @@ function AgentBridge() {
         } catch {
           return;
         }
+        if (cmd.kind === "assignTabId") {
+          const newId = cmd.tabId;
+          if (newId) {
+            adoptTabId(newId);
+            setTabIdState(newId);
+          }
+          return;
+        }
         if (cmd.kind !== "command") return;
-        const fid = pushFeed(cmd.op, describe(cmd));
+        const narration = String(cmd.message ?? cmd.args?.message ?? "").slice(0, 300);
+        if (cmd.op === "think" || cmd.op === "status") {
+          const msg = narration;
+          const kind = cmd.args?.kind || (cmd.op === "think" ? "thinking" : "action");
+          const dwellMs = typeof cmd.args?.dwellMs === "number" ? cmd.args.dwellMs : void 0;
+          setThinking(msg);
+          if (prefsRef.current.fx) FX?.say(msg, dwellMs, kind);
+          send({ kind: "result", id: cmd.id, ok: true, value: { acknowledged: true } });
+          return;
+        }
+        if (pausedRef.current) {
+          await waitWhilePaused();
+        }
+        setThinking(narration || actionLabel(cmd));
         setBusy(true);
         try {
-          highlight(cmd);
-          const value = await run(cmd.op, cmd.args);
-          settleFeed(fid, "ok");
+          let value;
+          if (prefsRef.current.fx) {
+            FX?.say(narration || actionLabel(cmd));
+            if (cmd.op === "fill_form" && FX) {
+              value = await FX.fillForm(
+                cmd.args.fields || [],
+                narration
+              );
+            } else {
+              await FX?.before(cmd);
+              if (cmd.op === "fill" && FX) {
+                value = await FX.typeFill(String(cmd.args.selector), String(cmd.args.value ?? ""));
+              } else {
+                value = await run(cmd.op, cmd.args);
+              }
+            }
+          } else {
+            if (cmd.op === "fill_form") {
+              value = await run("fill_form", cmd.args);
+            } else {
+              value = await run(cmd.op, cmd.args);
+            }
+          }
+          if (prefsRef.current.fx) FX?.after(cmd);
           send({ kind: "result", id: cmd.id, ok: true, value });
         } catch (err) {
-          settleFeed(fid, "error");
+          if (prefsRef.current.fx) FX?.fail(cmd);
           send({ kind: "result", id: cmd.id, ok: false, error: errMsg(err) });
         } finally {
           setBusy(false);
         }
       };
       ws.onclose = () => {
+        clearTimeout(tryNext);
         ws = null;
         setStatus("disconnected");
-        if (!closed) retry = setTimeout(connect, 1500);
+        const delay = opened ? 1200 : 250;
+        if (!closed) retry = setTimeout(connect, delay);
       };
       ws.onerror = () => ws?.close();
     };
@@ -242,91 +367,595 @@ function AgentBridge() {
       ws?.close();
     };
   }, []);
-  return /* @__PURE__ */ jsx(Hud, { status, feed, busy });
+  if (!mounted) return null;
+  return /* @__PURE__ */ jsxs(Fragment, { children: [
+    /* @__PURE__ */ jsx(
+      "div",
+      {
+        ref: fxLayer,
+        "data-agent-bridge-hud": true,
+        style: { position: "fixed", inset: 0, zIndex: 2147483646, pointerEvents: "none", overflow: "hidden" }
+      }
+    ),
+    /* @__PURE__ */ jsx(
+      Hud,
+      {
+        status,
+        busy,
+        thinking,
+        paused,
+        tabId: tabIdState,
+        prefs,
+        onTogglePause: () => setPaused((p) => !p),
+        onToggleFx: () => setPrefs((p) => ({ ...p, fx: !p.fx })),
+        onToggleCollapsed: () => setPrefs((p) => ({ ...p, collapsed: !p.collapsed })),
+        onSpeed: (v) => setPrefs((p) => ({ ...p, speed: v })),
+        onMove: (pos) => setPrefs((p) => ({ ...p, pos }))
+      }
+    )
+  ] });
 }
-function Hud({ status, feed, busy }) {
+var _AgentFx = class _AgentFx {
+  // a message stays at least this long before idle phrases
+  constructor(getLayer, getPrefs) {
+    __publicField(this, "getLayer");
+    __publicField(this, "getPrefs");
+    __publicField(this, "cursor", null);
+    __publicField(this, "spot", null);
+    __publicField(this, "tip", null);
+    __publicField(this, "cx", -100);
+    __publicField(this, "cy", -100);
+    // Persistent "speech" toast that types out the agent's narration (Claude-Code style).
+    __publicField(this, "sayBox", null);
+    __publicField(this, "sayText", null);
+    __publicField(this, "sayDot", null);
+    __publicField(this, "sayToken", 0);
+    // cancels an in-flight typing animation when a newer one starts
+    __publicField(this, "sayHideTimer", null);
+    __publicField(this, "idleTimer", null);
+    __publicField(this, "idleIdx", 0);
+    this.getLayer = getLayer;
+    this.getPrefs = getPrefs;
+  }
+  speed() {
+    return this.getPrefs().speed || 1;
+  }
+  // Pace by speed, but floor so a high speed setting can never make effects invisible.
+  ms(base) {
+    return Math.max(220, base / this.speed());
+  }
+  ensureCursor() {
+    const layer = this.getLayer();
+    if (!layer) return null;
+    if (!this.cursor) {
+      const c = document.createElement("div");
+      c.style.cssText = `position:absolute;width:30px;height:30px;left:0;top:0;transform:translate(-200px,-200px);transition:transform .55s cubic-bezier(.22,1,.36,1);z-index:6;will-change:transform;background:no-repeat center/contain url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'><path d='M3 2l7 18 2.5-7.5L20 10z' fill='%2338bdf8' stroke='white' stroke-width='1.5' stroke-linejoin='round'/></svg>");filter:drop-shadow(0 0 8px rgba(56,189,248,.95)) drop-shadow(0 2px 4px rgba(0,0,0,.5));`;
+      const halo = document.createElement("div");
+      halo.style.cssText = "position:absolute;left:-9px;top:-9px;width:30px;height:30px;border-radius:50%;background:radial-gradient(circle,rgba(56,189,248,.45),rgba(56,189,248,0) 70%);animation:agentCursorPulse 1.4s ease-out infinite;";
+      c.appendChild(halo);
+      layer.appendChild(c);
+      this.cursor = c;
+    }
+    return this.cursor;
+  }
+  rectOf(sel) {
+    if (!sel) return null;
+    const el2 = document.querySelector(sel);
+    if (!el2) return null;
+    el2.scrollIntoView({ block: "center", behavior: "smooth" });
+    return el2.getBoundingClientRect();
+  }
+  // Glide the cursor to a point and resolve when it arrives.
+  moveTo(x, y) {
+    const c = this.ensureCursor();
+    if (!c) return Promise.resolve();
+    this.cx = x;
+    this.cy = y;
+    c.style.transitionDuration = `${this.ms(500)}ms`;
+    c.style.transform = `translate(${x}px, ${y}px)`;
+    return new Promise((r) => setTimeout(r, this.ms(520)));
+  }
+  // Spotlight + labeled tooltip around a rect.
+  spotlight(rect, label) {
+    const layer = this.getLayer();
+    if (!layer) return;
+    if (!this.spot) {
+      this.spot = document.createElement("div");
+      this.spot.style.cssText = "position:absolute;border-radius:10px;z-index:3;pointer-events:none;box-shadow:0 0 0 3px #38bdf8, 0 0 0 100000px rgba(2,6,23,.6), 0 0 30px 6px rgba(56,189,248,.85);transition:all .4s cubic-bezier(.22,1,.36,1);animation:agentSpotPulse 1.1s ease-in-out infinite;";
+      layer.appendChild(this.spot);
+    }
+    const pad = 6;
+    this.spot.style.left = `${rect.left - pad}px`;
+    this.spot.style.top = `${rect.top - pad}px`;
+    this.spot.style.width = `${rect.width + pad * 2}px`;
+    this.spot.style.height = `${rect.height + pad * 2}px`;
+    this.spot.style.opacity = "1";
+    if (!this.tip) {
+      this.tip = document.createElement("div");
+      this.tip.style.cssText = "position:absolute;z-index:5;pointer-events:none;max-width:300px;padding:6px 11px;border-radius:8px;font:700 13px/1.3 ui-sans-serif,system-ui,sans-serif;color:#fff;background:#0ea5e9;box-shadow:0 8px 22px rgba(0,0,0,.45);transition:all .3s ease;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;";
+      layer.appendChild(this.tip);
+    }
+    this.tip.style.background = "#0ea5e9";
+    this.tip.textContent = label;
+    const top = rect.top - 36 < 8 ? rect.bottom + 10 : rect.top - 36;
+    this.tip.style.left = `${Math.max(8, rect.left)}px`;
+    this.tip.style.top = `${top}px`;
+    this.tip.style.opacity = "1";
+  }
+  clearSpotlight() {
+    if (this.spot) this.spot.style.opacity = "0";
+    if (this.tip) this.tip.style.opacity = "0";
+  }
+  // Click ripple at the current cursor position.
+  ripple() {
+    const layer = this.getLayer();
+    if (!layer) return;
+    const r = document.createElement("div");
+    r.style.cssText = `position:absolute;left:${this.cx}px;top:${this.cy}px;width:8px;height:8px;border-radius:50%;background:rgba(56,189,248,.55);z-index:3;transform:translate(-50%,-50%);animation:agentRipple ${this.ms(550)}ms ease-out forwards;`;
+    layer.appendChild(r);
+    setTimeout(() => r.remove(), this.ms(600));
+  }
+  // A floating toast at top-center (like a navigation toast). Used for thinking + notices.
+  // Both kinds use the dark/black style the user prefers; thinking gets a 💭 and an accent bar.
+  toast(text, kind = "info") {
+    const layer = this.getLayer();
+    if (!layer || !text) return;
+    const t = document.createElement("div");
+    t.style.cssText = "position:absolute;left:50%;top:18px;transform:translateX(-50%) translateY(-12px);z-index:7;display:flex;align-items:center;gap:9px;max-width:min(640px,90vw);padding:11px 16px;border-radius:12px;color:#f1f5f9;font:600 14px/1.4 ui-sans-serif,system-ui,sans-serif;background:rgba(15,23,42,.97);border:1px solid " + (kind === "think" ? "#8b5cf6" : "#334155") + ";box-shadow:0 14px 40px rgba(0,0,0,.55);opacity:0;transition:all .4s cubic-bezier(.22,1,.36,1);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;";
+    if (kind === "think") {
+      const dot = document.createElement("span");
+      dot.style.cssText = "flex:0 0 auto;font-size:16px;";
+      dot.textContent = "\u{1F4AD}";
+      t.appendChild(dot);
+    }
+    const span = document.createElement("span");
+    span.style.cssText = "overflow:hidden;text-overflow:ellipsis;";
+    span.textContent = text;
+    t.appendChild(span);
+    layer.appendChild(t);
+    requestAnimationFrame(() => {
+      t.style.opacity = "1";
+      t.style.transform = "translateX(-50%) translateY(0)";
+    });
+    const life = kind === "think" ? this.ms(4200) : this.ms(2800);
+    setTimeout(() => {
+      t.style.opacity = "0";
+      t.style.transform = "translateX(-50%) translateY(-12px)";
+      setTimeout(() => t.remove(), 420);
+    }, life);
+  }
+  // A persistent status bar fixed to the BOTTOM-CENTER of the screen (not page-anchored). Created
+  // once and kept visible from connection onward; say() retypes its text.
+  ensureSayBox() {
+    const layer = this.getLayer();
+    if (!layer) return null;
+    if (!this.sayBox) {
+      const box = document.createElement("div");
+      box.style.cssText = "position:fixed;left:50%;bottom:18px;transform:translateX(-50%);z-index:2147483646;display:flex;align-items:center;gap:10px;max-width:min(760px,94vw);min-width:240px;padding:12px 18px;border-radius:14px;color:#f1f5f9;font:600 14px/1.4 ui-sans-serif,system-ui,sans-serif;background:rgba(12,18,32,.97);border:1px solid #334155;box-shadow:0 18px 50px rgba(0,0,0,.6);opacity:0;transition:opacity .3s ease;white-space:nowrap;pointer-events:none;";
+      const dot = document.createElement("span");
+      dot.textContent = "\u2726";
+      dot.style.cssText = "flex:0 0 auto;color:#a78bfa;font-size:16px;animation:agentThink 1.6s ease-in-out infinite;";
+      const txt = document.createElement("span");
+      txt.style.cssText = "overflow:hidden;text-overflow:ellipsis;";
+      const caret = document.createElement("span");
+      caret.textContent = "\u258C";
+      caret.style.cssText = "color:#a78bfa;animation:agentCaret 1s step-end infinite;margin-left:1px;flex:0 0 auto;";
+      box.appendChild(dot);
+      box.appendChild(txt);
+      box.appendChild(caret);
+      layer.appendChild(box);
+      this.sayBox = box;
+      this.sayText = txt;
+      this.sayDot = dot;
+    }
+    return this.sayBox;
+  }
+  // Show the status bar (call on connect) with idle text. Stays visible.
+  showBar(idle = "Agent connected \u2014 ready") {
+    const box = this.ensureSayBox();
+    if (!box || !this.sayText) return;
+    box.style.opacity = "1";
+    if (!this.sayText.textContent) this.sayText.textContent = idle;
+  }
+  hideBar() {
+    if (this.sayBox) this.sayBox.style.opacity = "0";
+  }
+  clearTimers() {
+    if (this.sayHideTimer) clearTimeout(this.sayHideTimer);
+    if (this.idleTimer) clearTimeout(this.idleTimer);
+    this.sayHideTimer = null;
+    this.idleTimer = null;
+  }
+  // After a message has been shown for its dwell time with nothing new, cycle gentle idle phrases
+  // (Thinking… / Planning… / Waiting…) so the bar is alive but never overwrites a fresh message.
+  startIdleCycle(token, dwellMs) {
+    this.idleTimer = setTimeout(() => {
+      if (token !== this.sayToken || !this.sayText) return;
+      const n = _AgentFx.IDLE_PHRASES.length;
+      let next = Math.floor(Math.random() * n);
+      if (next === this.idleIdx) next = (next + 1) % n;
+      this.idleIdx = next;
+      const phrase = _AgentFx.IDLE_PHRASES[next];
+      void this._type(phrase, token).then(() => {
+        if (token === this.sayToken) this.startIdleCycle(token, 4e3);
+      });
+    }, dwellMs);
+  }
+  // Low-level typer shared by say() and the idle cycle. Fast: ~12ms/char (NOT floored by ms()),
+  // and types 2 chars per tick so even long lines finish quickly.
+  async _type(msg, token) {
+    if (!this.sayText) return;
+    this.sayText.textContent = "";
+    const per = Math.max(6, Math.round(12 / (this.getPrefs().speed || 1)));
+    const step = msg.length > 60 ? 3 : 2;
+    for (let i = step; i < msg.length + step; i += step) {
+      if (token !== this.sayToken) return;
+      this.sayText.textContent = msg.slice(0, Math.min(i, msg.length));
+      if (i < msg.length) await new Promise((r) => setTimeout(r, per));
+    }
+  }
+  // Retype the status bar's text. The bar STAYS visible. A message is held for at least
+  // MIN_DWELL_MS (~10s); if nothing new arrives, idle phrases start cycling. `dwellMs` overrides.
+  // `kind` swaps the leading icon: action ✦ | thinking 💭 | code ⌘ (checking code) | net ⇅.
+  async say(text, dwellMs, kind = "action") {
+    const box = this.ensureSayBox();
+    if (!box || !this.sayText) return;
+    box.style.opacity = "1";
+    if (this.sayDot) {
+      const icon = kind === "thinking" ? "\u{1F4AD}" : kind === "code" ? "\u2318" : kind === "net" ? "\u21C5" : "\u2726";
+      this.sayDot.textContent = icon;
+      this.sayDot.style.color = kind === "code" ? "#34d399" : kind === "net" ? "#fbbf24" : "#a78bfa";
+    }
+    const msg = (text || "").trim() || "Working\u2026";
+    const token = ++this.sayToken;
+    this.clearTimers();
+    await this._type(msg, token);
+    if (token !== this.sayToken) return;
+    this.startIdleCycle(token, Math.max(1e3, dwellMs ?? _AgentFx.MIN_DWELL_MS));
+  }
+  // Before an action runs: travel the cursor to the target, THEN spotlight it (so the motion reads).
+  async before(cmd) {
+    const sel = cmd.args?.selector;
+    const rect = this.rectOf(sel);
+    if (rect) {
+      this.ensureCursor();
+      await this.moveTo(rect.left + rect.width / 2, rect.top + rect.height / 2);
+      this.spotlight(rect, actionLabel(cmd));
+      if (cmd.op === "click") this.ripple();
+      await new Promise((r) => setTimeout(r, this.ms(300)));
+    }
+  }
+  after(_cmd) {
+    setTimeout(() => this.clearSpotlight(), this.ms(1400));
+  }
+  fail(cmd) {
+    if (this.tip) {
+      this.tip.style.background = "#ef4444";
+      this.tip.textContent = `failed: ${actionLabel(cmd)}`;
+    }
+    setTimeout(() => this.clearSpotlight(), this.ms(1100));
+  }
+  // Typewriter fill: set the input value one character at a time (each a real React-visible change),
+  // updating the spotlight label as it goes. Falls back to instant if the element vanishes.
+  async typeFill(selector, value) {
+    const node = document.querySelector(selector);
+    if (!node) throw new Error(`No element matches selector: ${selector}`);
+    const tag = node.tagName.toLowerCase();
+    const type = tag === "input" ? (node.type || "text").toLowerCase() : tag;
+    const isTextLike = tag === "input" && !["checkbox", "radio", "date", "datetime-local", "time", "month", "week", "file", "range", "color"].includes(type) || tag === "textarea" || node.isContentEditable;
+    if (!isTextLike) {
+      const detail = setControlValue(node, value);
+      if (this.tip) this.tip.textContent = detail;
+      return { filled: selector, value, detail };
+    }
+    node.focus();
+    const editable = node.isContentEditable;
+    const setVal = (v) => {
+      if (editable) {
+        node.textContent = v;
+        node.dispatchEvent(new InputEvent("input", { bubbles: true }));
+      } else {
+        nativeSet(node, "value", v);
+        node.dispatchEvent(new Event("input", { bubbles: true }));
+      }
+    };
+    const per = Math.max(8, Math.round(22 / (this.getPrefs().speed || 1)));
+    const max = Math.min(value.length, 60);
+    for (let i = 1; i <= value.length; i++) {
+      setVal(value.slice(0, i));
+      if (this.tip) this.tip.textContent = `Typing "${value.slice(0, Math.min(i, 24))}${i > 24 ? "\u2026" : ""}"`;
+      if (i <= max) await new Promise((r) => setTimeout(r, per));
+    }
+    node.dispatchEvent(new Event("change", { bubbles: true }));
+    return { filled: selector, value };
+  }
+  // fill_form: fill an array of {selector,value} one-by-one, animating each like a person —
+  // cursor glides to the field, spotlight, fast typewriter — in a single round-trip.
+  async fillForm(fields, narration) {
+    const results = [];
+    for (let i = 0; i < fields.length; i++) {
+      const f = fields[i];
+      if (!f || !f.selector) {
+        results.push({ selector: String(f?.selector), ok: false, error: "missing selector" });
+        continue;
+      }
+      const hint = fieldHint(f.selector);
+      this.say(narration || `Filling ${hint || "field " + (i + 1)} (${i + 1}/${fields.length})`, void 0, "action");
+      const node = document.querySelector(f.selector);
+      if (!node) {
+        results.push({ selector: f.selector, ok: false, error: "no element matches selector" });
+        continue;
+      }
+      const rect = (node.scrollIntoView({ block: "center", behavior: "smooth" }), node.getBoundingClientRect());
+      this.ensureCursor();
+      await this.moveTo(rect.left + rect.width / 2, rect.top + rect.height / 2);
+      this.spotlight(rect, `Typing "${String(f.value).slice(0, 24)}"`);
+      try {
+        await this.typeFill(f.selector, String(f.value ?? ""));
+        results.push({ selector: f.selector, ok: true, value: String(f.value ?? "") });
+      } catch (e) {
+        results.push({ selector: f.selector, ok: false, error: e instanceof Error ? e.message : String(e) });
+      }
+      await new Promise((r) => setTimeout(r, this.ms(180)));
+    }
+    setTimeout(() => this.clearSpotlight(), this.ms(800));
+    const filled = results.filter((r) => r.ok).length;
+    return { filledForm: true, total: fields.length, filled, results };
+  }
+};
+__publicField(_AgentFx, "IDLE_PHRASES", [
+  "Thinking\u2026",
+  "Planning the next step\u2026",
+  "Looking around the page\u2026",
+  "Waiting for the agent\u2026",
+  "Working on it\u2026",
+  "Reading the layout\u2026",
+  "Reasoning about what to do next\u2026",
+  "Scanning for the right element\u2026",
+  "Checking the page state\u2026",
+  "Considering the options\u2026",
+  "Mapping out the form\u2026",
+  "Reviewing the DOM\u2026",
+  "Inspecting the components\u2026",
+  "Figuring out the next action\u2026",
+  "Gathering context\u2026",
+  "Analyzing the structure\u2026",
+  "Locating the controls\u2026",
+  "Double-checking the selectors\u2026",
+  "Tracing the data flow\u2026",
+  "Looking for the submit button\u2026",
+  "Parsing the response\u2026",
+  "Verifying the result\u2026",
+  "Waiting for the page to settle\u2026",
+  "Hold on, almost there\u2026",
+  "Lining things up\u2026",
+  "Cross-referencing the routes\u2026",
+  "Reading the network activity\u2026",
+  "Checking for errors\u2026",
+  "Making sure everything loaded\u2026",
+  "Deciding where to click\u2026",
+  "Composing the next move\u2026",
+  "Sizing up the page\u2026",
+  "Looking for the right field\u2026",
+  "Re-reading the requirements\u2026",
+  "Connecting the dots\u2026",
+  "Evaluating the state\u2026",
+  "Preparing the next step\u2026",
+  "Sketching a plan\u2026",
+  "Picking the best approach\u2026",
+  "Confirming the route\u2026",
+  "Sweeping the interface\u2026",
+  "Reading labels and inputs\u2026",
+  "Watching for changes\u2026",
+  "Letting the UI catch up\u2026",
+  "Tidying up the plan\u2026",
+  "Queuing the next action\u2026",
+  "Checking the form values\u2026",
+  "Looking at what changed\u2026",
+  "Re-orienting on the page\u2026",
+  "Thinking it through\u2026",
+  "Almost ready\u2026",
+  "Just a moment\u2026",
+  "Processing\u2026"
+]);
+__publicField(_AgentFx, "MIN_DWELL_MS", 1e4);
+var AgentFx = _AgentFx;
+function actionLabel(cmd) {
+  const a = cmd.args || {};
+  switch (cmd.op) {
+    case "click":
+      return `Clicking ${fieldHint(a.selector) || shortSel(a.selector)}`;
+    case "fill":
+      return `Typing "${String(a.value).slice(0, 24)}"${fieldHint(a.selector) ? " in " + fieldHint(a.selector) : ""}`;
+    case "fill_form":
+      return `Filling the form (${Array.isArray(a.fields) ? a.fields.length : 0} fields)`;
+    case "navigate":
+      return `Going to ${String(a.url)}`;
+    case "reload":
+      return a.hard ? "Hard-reloading the page" : "Reloading the page";
+    case "snapshot":
+      return "Reading the page";
+    case "page_context":
+      return "Checking where I am";
+    case "overview":
+      return "Scanning the page layout";
+    case "find":
+      return `Searching for "${String(a.query).slice(0, 30)}"`;
+    case "components":
+      return "Inspecting the React components";
+    case "component_for":
+      return "Finding the component for this element";
+    case "rerender":
+      return "Forcing a re-render";
+    case "wait_for":
+      return a.text ? `Waiting for "${String(a.text).slice(0, 30)}" to appear` : "Waiting for the page to update";
+    case "network_calls":
+      return "Checking network requests";
+    case "storage":
+      return `Reading ${String(a.area || "local")} storage`;
+    case "cache":
+      return "Inspecting the cache";
+    case "eval":
+      return "Running a quick check in the page";
+    case "screenshot":
+      return "Taking a screenshot";
+    case "open_tab":
+      return `Opening a new tab (${String(a.url)})`;
+    default:
+      return "Working\u2026";
+  }
+}
+function fieldHint(sel) {
+  try {
+    const el2 = sel ? document.querySelector(String(sel)) : null;
+    if (!el2) return "";
+    const name = labelFor(el2) || el2.placeholder || el2.getAttribute("name") || (el2.textContent || "").trim();
+    return name ? `"${name.slice(0, 28)}"` : "";
+  } catch {
+    return "";
+  }
+}
+function shortSel(sel) {
+  const s = String(sel ?? "");
+  return s.length > 28 ? s.slice(0, 28) + "\u2026" : s;
+}
+function Hud(props) {
+  const { status, busy, thinking, paused, prefs } = props;
   const color = status === "connected" ? "#22c55e" : status === "connecting" ? "#eab308" : "#ef4444";
   const label = status === "connected" ? "Agent connected" : status === "connecting" ? "Connecting\u2026" : "Agent offline";
+  const panelRef = useRef(null);
+  const drag = useRef(null);
+  const onHeaderPointerDown = (e) => {
+    if (e.target.closest("button,input,label")) return;
+    const el2 = panelRef.current;
+    if (!el2) return;
+    const r = el2.getBoundingClientRect();
+    drag.current = { dx: e.clientX - r.left, dy: e.clientY - r.top };
+    e.currentTarget.setPointerCapture(e.pointerId);
+    e.preventDefault();
+  };
+  const onHeaderPointerMove = (e) => {
+    if (!drag.current) return;
+    const w = panelRef.current?.offsetWidth || 320;
+    const h = panelRef.current?.offsetHeight || 120;
+    const x = Math.min(Math.max(0, e.clientX - drag.current.dx), window.innerWidth - w);
+    const y = Math.min(Math.max(0, e.clientY - drag.current.dy), window.innerHeight - h);
+    props.onMove({ x, y });
+  };
+  const onHeaderPointerUp = (e) => {
+    drag.current = null;
+    try {
+      e.currentTarget.releasePointerCapture(e.pointerId);
+    } catch {
+    }
+  };
+  const posStyle = prefs.pos ? { left: prefs.pos.x, top: prefs.pos.y } : { bottom: 16, right: 16 };
+  const btn = {
+    pointerEvents: "auto",
+    cursor: "pointer",
+    border: "1px solid #334155",
+    background: "#1e293b",
+    color: "#e2e8f0",
+    borderRadius: 6,
+    padding: "2px 7px",
+    font: "11px/1.2 ui-monospace, Menlo, monospace"
+  };
   return /* @__PURE__ */ jsxs(
     "div",
     {
+      ref: panelRef,
       style: {
         position: "fixed",
-        bottom: 16,
-        right: 16,
+        ...posStyle,
         zIndex: 2147483647,
         font: "12px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace",
         color: "#e5e7eb",
-        background: "rgba(17,24,39,0.92)",
+        background: "rgba(15,23,42,0.94)",
         border: `1px solid ${color}`,
-        borderRadius: 10,
-        padding: "8px 10px",
-        width: 280,
-        boxShadow: "0 8px 24px rgba(0,0,0,0.35)",
-        backdropFilter: "blur(6px)",
-        pointerEvents: "none",
+        borderRadius: 12,
+        padding: "9px 11px",
+        width: prefs.collapsed ? 200 : 320,
+        boxShadow: "0 10px 30px rgba(0,0,0,0.45)",
+        backdropFilter: "blur(8px)",
         userSelect: "none"
       },
       "data-agent-bridge-hud": true,
       children: [
-        /* @__PURE__ */ jsxs("div", { style: { display: "flex", alignItems: "center", gap: 8, marginBottom: feed.length ? 6 : 0 }, children: [
-          /* @__PURE__ */ jsx(
-            "span",
-            {
-              style: {
-                width: 9,
-                height: 9,
-                borderRadius: "50%",
-                background: color,
-                boxShadow: busy ? `0 0 0 0 ${color}` : "none",
-                animation: busy ? "agentPulse 1s infinite" : "none"
+        /* @__PURE__ */ jsxs(
+          "div",
+          {
+            onPointerDown: onHeaderPointerDown,
+            onPointerMove: onHeaderPointerMove,
+            onPointerUp: onHeaderPointerUp,
+            onDoubleClick: () => props.onMove(null),
+            style: { display: "flex", alignItems: "center", gap: 8, cursor: "grab", pointerEvents: "auto", touchAction: "none" },
+            title: "Drag to move \xB7 double-click to reset position",
+            children: [
+              /* @__PURE__ */ jsx(
+                "span",
+                {
+                  style: {
+                    width: 9,
+                    height: 9,
+                    borderRadius: "50%",
+                    background: color,
+                    animation: busy ? "agentPulse 1s infinite" : "none"
+                  }
+                }
+              ),
+              /* @__PURE__ */ jsx("strong", { style: { color: "#fff", fontWeight: 700 }, children: "nextjs-agent" }),
+              /* @__PURE__ */ jsx("span", { style: { marginLeft: "auto", color, fontSize: 11 }, children: label }),
+              /* @__PURE__ */ jsx("button", { style: btn, onClick: props.onToggleCollapsed, title: "Expand/collapse", children: prefs.collapsed ? "\u25A2" : "\u2014" })
+            ]
+          }
+        ),
+        /* @__PURE__ */ jsx("div", { style: { color: "#64748b", fontSize: 10, marginTop: 3 }, children: props.tabId }),
+        thinking && /* @__PURE__ */ jsxs(
+          "div",
+          {
+            style: {
+              marginTop: 7,
+              padding: "6px 8px",
+              borderRadius: 8,
+              background: "linear-gradient(135deg,rgba(99,102,241,.25),rgba(139,92,246,.25))",
+              border: "1px solid rgba(139,92,246,.4)",
+              color: "#e9d5ff",
+              fontSize: 12
+            },
+            children: [
+              "\u{1F4AD} ",
+              thinking
+            ]
+          }
+        ),
+        !prefs.collapsed && /* @__PURE__ */ jsx(Fragment, { children: /* @__PURE__ */ jsxs("div", { style: { display: "flex", gap: 6, marginTop: 8, flexWrap: "wrap", alignItems: "center" }, children: [
+          /* @__PURE__ */ jsx("button", { style: { ...btn, ...paused ? { background: "#7c2d12", borderColor: "#9a3412" } : {} }, onClick: props.onTogglePause, children: paused ? "\u25B6 Resume" : "\u23F8 Pause" }),
+          /* @__PURE__ */ jsx("button", { style: { ...btn, ...prefs.fx ? { background: "#075985", borderColor: "#0369a1" } : {} }, onClick: props.onToggleFx, title: "Toggle fancy animations", children: prefs.fx ? "\u2728 FX on" : "FX off" }),
+          /* @__PURE__ */ jsxs("label", { style: { display: "flex", alignItems: "center", gap: 4, color: "#94a3b8", fontSize: 10, pointerEvents: "auto" }, children: [
+            "spd",
+            /* @__PURE__ */ jsx(
+              "input",
+              {
+                type: "range",
+                min: 0.5,
+                max: 3,
+                step: 0.5,
+                value: prefs.speed,
+                onChange: (e) => props.onSpeed(Number(e.target.value)),
+                style: { width: 56, pointerEvents: "auto" }
               }
-            }
-          ),
-          /* @__PURE__ */ jsx("strong", { style: { color: "#fff", fontWeight: 600 }, children: "nextjs-agent" }),
-          /* @__PURE__ */ jsx("span", { style: { marginLeft: "auto", color }, children: label })
-        ] }),
-        /* @__PURE__ */ jsx("div", { style: { color: "#6b7280", fontSize: 10, marginBottom: feed.length ? 6 : 0 }, children: TAB_ID }),
-        feed.map((it) => /* @__PURE__ */ jsxs("div", { style: { display: "flex", gap: 6, opacity: it.state === "running" ? 1 : 0.7, marginTop: 3 }, children: [
-          /* @__PURE__ */ jsx("span", { style: { width: 12 }, children: it.state === "running" ? "\u25B8" : it.state === "ok" ? "\u2713" : "\u2717" }),
-          /* @__PURE__ */ jsx("span", { style: { color: it.state === "error" ? "#fca5a5" : "#93c5fd" }, children: it.op }),
-          /* @__PURE__ */ jsx("span", { style: { color: "#9ca3af", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }, children: it.detail })
-        ] }, it.id)),
+            )
+          ] })
+        ] }) }),
         /* @__PURE__ */ jsx("style", { children: `@keyframes agentPulse{0%{box-shadow:0 0 0 0 ${color}80}70%{box-shadow:0 0 0 6px ${color}00}100%{box-shadow:0 0 0 0 ${color}00}}
-        @keyframes agentRing{0%{box-shadow:0 0 0 2px #38bdf8,0 0 0 6px #38bdf855}100%{box-shadow:0 0 0 2px #38bdf800,0 0 0 14px #38bdf800}}` })
+        @keyframes agentRipple{0%{width:10px;height:10px;opacity:.65}100%{width:80px;height:80px;opacity:0}}
+        @keyframes agentCursorPulse{0%{transform:scale(.6);opacity:.8}100%{transform:scale(2.2);opacity:0}}
+        @keyframes agentSpotPulse{0%,100%{box-shadow:0 0 0 3px #38bdf8,0 0 0 100000px rgba(2,6,23,.6),0 0 26px 4px rgba(56,189,248,.7)}50%{box-shadow:0 0 0 4px #7dd3fc,0 0 0 100000px rgba(2,6,23,.62),0 0 40px 10px rgba(56,189,248,.95)}}
+        @keyframes agentCaret{0%,100%{opacity:1}50%{opacity:0}}
+        @keyframes agentThink{0%,100%{opacity:.5;transform:rotate(0deg)}50%{opacity:1;transform:rotate(180deg)}}` })
       ]
     }
   );
-}
-function highlight(cmd) {
-  const sel = cmd.args?.selector;
-  if (!sel) return;
-  const node = document.querySelector(sel);
-  if (!node) return;
-  const prev = node.style.animation;
-  node.style.animation = "agentRing 0.8s ease-out";
-  setTimeout(() => {
-    node.style.animation = prev;
-  }, 800);
-}
-function describe(cmd) {
-  const a = cmd.args || {};
-  if (cmd.op === "fill") return `${a.selector} = "${String(a.value).slice(0, 20)}"`;
-  if (cmd.op === "navigate") return String(a.url);
-  if (cmd.op === "wait_for") return a.selector || (a.text ? `text:"${a.text}"` : "");
-  if (cmd.op === "snapshot") return "reading page\u2026";
-  if (cmd.op === "page_context") return location.pathname;
-  if (cmd.op === "open_tab") return `open ${String(a.url)}`;
-  if (cmd.op === "reload") return a.hard ? "hard reload" : "reload";
-  if (cmd.op === "network_calls") return Array.isArray(a.types) ? a.types.join(",") : "all calls";
-  if (cmd.op === "storage") return `${a.area || "local"} ${a.action || "get"}${a.key ? " " + a.key : ""}`;
-  if (cmd.op === "cache") return `cache ${a.action || "list"}`;
-  if (cmd.op === "eval") return String(a.code).slice(0, 28);
-  if (cmd.op === "screenshot") return "capturing\u2026";
-  if (cmd.op === "find") return `find "${String(a.query)}"`;
-  if (cmd.op === "overview") return "page overview\u2026";
-  if (a.selector) return String(a.selector);
-  return "";
 }
 async function run(op, args) {
   switch (op) {
@@ -334,6 +963,18 @@ async function run(op, args) {
       return doClick(String(args.selector));
     case "fill":
       return doFill(String(args.selector), String(args.value ?? ""));
+    case "fill_form": {
+      const fields = args.fields || [];
+      const results = fields.map((f) => {
+        try {
+          doFill(String(f.selector), String(f.value ?? ""));
+          return { selector: f.selector, ok: true };
+        } catch (e) {
+          return { selector: f.selector, ok: false, error: e instanceof Error ? e.message : String(e) };
+        }
+      });
+      return { filledForm: true, total: fields.length, filled: results.filter((r) => r.ok).length, results };
+    }
     case "snapshot":
       return doSnapshot();
     case "page_context":
@@ -584,16 +1225,85 @@ function doClick(selector) {
   }
   return { clicked: selector };
 }
+function setControlValue(node, value) {
+  const tag = node.tagName.toLowerCase();
+  if (tag === "select") {
+    const sel = node;
+    const opts = Array.from(sel.options);
+    let opt = opts.find((o) => o.value === value) || opts.find((o) => o.text.trim().toLowerCase() === value.trim().toLowerCase()) || opts.find((o) => o.text.trim().toLowerCase().includes(value.trim().toLowerCase()));
+    if (!opt) throw new Error(`No <option> matching "${value}" (have: ${opts.map((o) => o.text.trim()).slice(0, 8).join(", ")})`);
+    nativeSet(sel, "value", opt.value);
+    sel.dispatchEvent(new Event("input", { bubbles: true }));
+    sel.dispatchEvent(new Event("change", { bubbles: true }));
+    return `selected "${opt.text.trim()}"`;
+  }
+  if (tag === "input") {
+    const input = node;
+    const type = (input.type || "text").toLowerCase();
+    if (type === "checkbox") {
+      const want = /^(true|1|on|yes|checked)$/i.test(value.trim());
+      if (input.checked !== want) input.click();
+      return `checkbox ${input.checked ? "checked" : "unchecked"}`;
+    }
+    if (type === "radio") {
+      const group = input.name ? Array.from(document.querySelectorAll(`input[type="radio"][name="${CSS.escape(input.name)}"]`)) : [input];
+      const target = group.find((r) => r.value === value) || group.find((r) => (r.labels?.[0]?.textContent || "").trim().toLowerCase() === value.trim().toLowerCase()) || input;
+      if (!target.checked) target.click();
+      return `radio "${target.value}" selected`;
+    }
+    if (type === "date" || type === "datetime-local" || type === "time" || type === "month" || type === "week") {
+      const v = normalizeDateValue(type, value);
+      nativeSet(input, "value", v);
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+      input.dispatchEvent(new Event("change", { bubbles: true }));
+      return `set ${type} to "${v}"`;
+    }
+    if (type === "file") {
+      throw new Error("file inputs cannot be set programmatically (OS picker); use the upload tool path");
+    }
+    nativeSet(input, "value", value);
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+    input.dispatchEvent(new Event("change", { bubbles: true }));
+    return `typed "${value}"`;
+  }
+  if (tag === "textarea") {
+    nativeSet(node, "value", value);
+    node.dispatchEvent(new Event("input", { bubbles: true }));
+    node.dispatchEvent(new Event("change", { bubbles: true }));
+    return `typed "${value}"`;
+  }
+  if (node.isContentEditable) {
+    node.focus();
+    node.textContent = value;
+    node.dispatchEvent(new InputEvent("input", { bubbles: true }));
+    return `set contenteditable text`;
+  }
+  throw new Error(`Don't know how to fill <${tag}> \u2014 not a known input type`);
+}
+function nativeSet(node, prop, v) {
+  const tag = node.tagName.toLowerCase();
+  const proto = tag === "select" ? HTMLSelectElement.prototype : tag === "textarea" ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+  const setter = Object.getOwnPropertyDescriptor(proto, prop)?.set;
+  if (setter) setter.call(node, v);
+  else node[prop] = v;
+}
+function normalizeDateValue(type, value) {
+  const v = value.trim();
+  if (type === "time") return v;
+  if (/^\d{4}-\d{2}-\d{2}/.test(v)) return type === "datetime-local" ? v.replace(" ", "T").slice(0, 16) : v.slice(0, type === "month" ? 7 : 10);
+  const d = new Date(v);
+  if (isNaN(d.getTime())) return v;
+  const pad = (n) => String(n).padStart(2, "0");
+  const ymd = `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+  if (type === "month") return ymd.slice(0, 7);
+  if (type === "datetime-local") return `${ymd}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+  return ymd;
+}
 function doFill(selector, value) {
   const node = el(selector);
-  const proto = node instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
-  const setter = Object.getOwnPropertyDescriptor(proto, "value")?.set;
   node.focus();
-  if (setter) setter.call(node, value);
-  else node.value = value;
-  node.dispatchEvent(new Event("input", { bubbles: true }));
-  node.dispatchEvent(new Event("change", { bubbles: true }));
-  return { filled: selector, value };
+  const detail = setControlValue(node, value);
+  return { filled: selector, value, detail };
 }
 function cssPath(node) {
   if (node.id) return `#${CSS.escape(node.id)}`;

@@ -3,6 +3,7 @@
 // Phase 1: Mode-A (headless) introspection — route_map + get_errors. No browser.
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
+import { createServer } from 'node:http';
 import { z } from 'zod';
 
 import { loadConfig } from './config.js';
@@ -14,6 +15,47 @@ const config = loadConfig();
 const tracker = new ErrorTracker();
 const bridge = new BridgeServer({ port: config.wsPort });
 bridge.start();
+
+// Optional local HTTP control endpoint — lets you drive the bridge via curl, independent of the
+// stdio MCP session (handy for debugging/demo). Enabled only when --http-port is set.
+//   GET  /status                      -> bridge.status()
+//   GET  /tabs                        -> bridge.listTabs()
+//   POST /op   {op,args,tabId,all}    -> bridge.dispatch(op,args,{tabId,all})
+//   GET  /route_map                   -> buildRouteMap(project)
+function startHttpControl(port) {
+  const srv = createServer((req, res) => {
+    const send = (code, obj) => {
+      res.writeHead(code, { 'content-type': 'application/json', 'access-control-allow-origin': '*' });
+      res.end(JSON.stringify(obj));
+    };
+    const url = req.url || '/';
+    if (req.method === 'GET' && url === '/status') return send(200, bridge.status());
+    if (req.method === 'GET' && url === '/tabs') return send(200, bridge.listTabs());
+    if (req.method === 'GET' && url === '/route_map') {
+      buildRouteMap(config.project).then((r) => send(200, r)).catch((e) => send(500, { error: String(e) }));
+      return;
+    }
+    if (req.method === 'POST' && url === '/op') {
+      let body = '';
+      req.on('data', (c) => (body += c));
+      req.on('end', async () => {
+        try {
+          const { op, args = {}, tabId = null, all = false, timeoutMs } = JSON.parse(body || '{}');
+          if (!op) return send(400, { error: 'missing op' });
+          const r = await bridge.dispatch(op, args, { tabId, all, timeoutMs: timeoutMs || 15000 });
+          send(200, r);
+        } catch (e) {
+          send(400, { error: String(e) });
+        }
+      });
+      return;
+    }
+    send(404, { error: 'not found', endpoints: ['GET /status', 'GET /tabs', 'GET /route_map', 'POST /op'] });
+  });
+  srv.on('error', (e) => console.error('[http-control] error:', e.message));
+  srv.listen(port, '127.0.0.1', () => console.error(`[http-control] listening on http://127.0.0.1:${port}`));
+}
+if (config.httpPort) startHttpControl(config.httpPort);
 
 const server = new McpServer({
   name: 'nextjs-agent-mcp',
@@ -86,10 +128,16 @@ server.registerTool(
 
 // ---- Mode B (bridge) tools -------------------------------------------------
 
-// Shared targeting params for tab-aware tools. `tabId` targets a specific tab (from list_tabs);
-// omit it to target the most-recently-connected tab. `all: true` broadcasts to every tab.
-const TAB_TARGET = { tabId: z.string().optional(), all: z.boolean().optional() };
-const targetOpts = ({ tabId, all }, extra = {}) => ({ tabId: tabId ?? null, all: all ?? false, ...extra });
+// Shared params for tab-aware tools.
+//   tabId   — target a specific tab (from list_tabs); omit for the most-recently-connected tab
+//   all     — broadcast to every connected tab
+//   message — short (≤2 lines) narration of what you're doing in THIS call; typed into the on-page
+//             toast so a human can follow along. Optional but encouraged.
+const MSG = { message: z.string().optional() };
+const TAB_TARGET = { tabId: z.string().optional(), all: z.boolean().optional(), ...MSG };
+const targetOpts = ({ tabId, all, message }, extra = {}) => ({ tabId: tabId ?? null, all: all ?? false, message: message ?? null, ...extra });
+// For tabId-only tools (no broadcast): build dispatch opts including message.
+const tabOpts = ({ tabId, message }, extra = {}) => ({ tabId: tabId ?? null, message: message ?? null, ...extra });
 
 server.registerTool(
   'bridge_status',
@@ -107,10 +155,43 @@ server.registerTool(
   {
     title: 'List connected tabs',
     description:
-      'List every browser tab currently connected via <AgentBridge/>: each tab\'s `tabId`, url, pathname, and title, plus the `defaultTabId` (the most-recently-connected tab that tab-aware tools target when no tabId is given). Use the tabId to target a specific tab in click/fill/snapshot/etc.',
+      'List every browser tab currently connected via <AgentBridge/>: each tab\'s `tabId`, url, pathname, and title, plus `activeTabId` (the pinned tab from switch_tab, if any) and `defaultTabId` (the tab that tab-aware tools target when no tabId is given). Use a tabId to target a specific tab, or switch_tab to pin one.',
     inputSchema: {},
   },
   async () => json(bridge.listTabs())
+);
+
+server.registerTool(
+  'current_tab',
+  {
+    title: 'Current (active) tab',
+    description:
+      'Report which tab is currently active — the one tab-aware tools target by default. Returns `activeTabId` (set via switch_tab, or null), `defaultTabId` (effective default), `sticky` (whether an active tab is pinned), and the tab\'s url/pathname/title.',
+    inputSchema: {},
+  },
+  async () => json(bridge.currentTab())
+);
+
+server.registerTool(
+  'switch_tab',
+  {
+    title: 'Switch the active tab',
+    description:
+      'Set the sticky active tab so all subsequent tab-aware tools (click/fill/snapshot/etc.) target it by default — until you switch again. Pass `tabId` (from list_tabs) to pin it, or omit/clear to revert to the most-recently-connected tab. The newly-active tab shows a "Now controlling this tab" status so a human can see which one is active.',
+    inputSchema: { tabId: z.string().optional() },
+  },
+  async ({ tabId }) => {
+    const res = bridge.setActiveTab(tabId ?? null);
+    // Visually mark the newly-active tab (best-effort; ignore if it can't be reached).
+    if (res.ok && tabId) {
+      try {
+        await bridge.dispatch('status', { message: 'Now controlling this tab', kind: 'action' }, { tabId, timeoutMs: 4000 });
+      } catch {
+        /* non-fatal */
+      }
+    }
+    return json(res);
+  }
 );
 
 server.registerTool(
@@ -119,9 +200,9 @@ server.registerTool(
     title: 'Open a new browser tab',
     description:
       'Open a new browser tab at `url` (path-only like "/en/..." is resolved against the current origin). An existing connected tab performs the window.open, and the new tab auto-connects with its own tabId — call list_tabs afterward to get it. Requires at least one tab already connected and popups allowed for the origin. Use `tabId` to choose which existing tab opens it.',
-    inputSchema: { url: z.string(), tabId: z.string().optional() },
+    inputSchema: { url: z.string(), tabId: z.string().optional(), ...MSG },
   },
-  async ({ url, tabId }) => json(await bridge.dispatch('open_tab', { url }, { tabId: tabId ?? null }))
+  async ({ url, tabId, message }) => json(await bridge.dispatch('open_tab', { url }, tabOpts({ tabId, message })))
 );
 
 server.registerTool(
@@ -132,19 +213,37 @@ server.registerTool(
       'Click an element by CSS selector, firing a real pointer+mouse+click sequence so React/MUI handlers run. Targets the default tab unless `tabId` is given (or `all` to click in every tab). Requires a connected tab.',
     inputSchema: { selector: z.string(), ...TAB_TARGET },
   },
-  async ({ selector, tabId, all }) => json(await bridge.dispatch('click', { selector }, targetOpts({ tabId, all })))
+  async ({ selector, tabId, all, message }) => json(await bridge.dispatch('click', { selector }, targetOpts({ tabId, all, message })))
 );
 
 server.registerTool(
   'fill',
   {
-    title: 'Fill input (real input event)',
+    title: 'Fill any input (type-aware)',
     description:
-      'Set the value of an input/textarea via the native value setter + a real `input` event, so React onChange and MUI controlled inputs register the change. Targets the default tab unless `tabId` is given (or `all`). Requires a connected tab.',
+      'Set the value of a form control, choosing the right strategy for its type: text/email/number/textarea (typed), `<select>` (match by option value OR visible label), checkbox/radio (true/false/on or value/label match), date/time (common formats normalized), contenteditable. Fires real input/change events so React & MUI register it. ' +
+      'Note: native `<select>` only — JS/MUI custom dropdowns (div-based) need click-to-open then click the option. Targets the default tab unless `tabId` is given (or `all`). Requires a connected tab.',
     inputSchema: { selector: z.string(), value: z.string(), ...TAB_TARGET },
   },
-  async ({ selector, value, tabId, all }) =>
-    json(await bridge.dispatch('fill', { selector, value }, targetOpts({ tabId, all })))
+  async ({ selector, value, tabId, all, message }) =>
+    json(await bridge.dispatch('fill', { selector, value }, targetOpts({ tabId, all, message })))
+);
+
+server.registerTool(
+  'fill_form',
+  {
+    title: 'Fill multiple fields in one call',
+    description:
+      'Fill an entire form in a SINGLE call: pass `fields` as an array of {selector, value}. The bridge fills them one-by-one (cursor travels to each field + types it), so it stays visibly "controlled" but avoids a round-trip per field. ' +
+      'Get the selectors from snapshot/find (use each field\'s `selector`). Returns per-field results. Targets the default tab unless `tabId` is given.',
+    inputSchema: {
+      fields: z.array(z.object({ selector: z.string(), value: z.string() })),
+      tabId: z.string().optional(),
+      ...MSG,
+    },
+  },
+  async ({ fields, tabId, message }) =>
+    json(await bridge.dispatch('fill_form', { fields }, tabOpts({ tabId, message }, { timeoutMs: 60000 })))
 );
 
 server.registerTool(
@@ -158,9 +257,9 @@ server.registerTool(
       '`fields` (every input/select/textarea with label, name, id, type, current value, required, options, and a stable `selector`), and ' +
       '`actions` (buttons/links you can click, with their visible text + selector). ' +
       'Always call this before fill/click — pass a field/action `selector` from here to fill/click, and address fields by their `name`/`label`. Targets the default tab unless `tabId` is given. Requires a connected tab.',
-    inputSchema: { tabId: z.string().optional() },
+    inputSchema: { tabId: z.string().optional(), ...MSG },
   },
-  async ({ tabId }) => json(await bridge.dispatch('snapshot', {}, { tabId: tabId ?? null }))
+  async ({ tabId, message }) => json(await bridge.dispatch('snapshot', {}, tabOpts({ tabId, message })))
 );
 
 server.registerTool(
@@ -169,9 +268,39 @@ server.registerTool(
     title: 'Where am I (current route)',
     description:
       'Lightweight "what page am I on" for a tab: url, pathname, detected locale, document title, and the visible page heading. Cheaper than snapshot. Targets the default tab unless `tabId` is given. Requires a connected tab.',
-    inputSchema: { tabId: z.string().optional() },
+    inputSchema: { tabId: z.string().optional(), ...MSG },
   },
-  async ({ tabId }) => json(await bridge.dispatch('page_context', {}, { tabId: tabId ?? null }))
+  async ({ tabId, message }) => json(await bridge.dispatch('page_context', {}, tabOpts({ tabId, message })))
+);
+
+server.registerTool(
+  'think',
+  {
+    title: 'Narrate intent (show in HUD)',
+    description:
+      'Send a short first-person message describing what you are about to do or your current reasoning (e.g. "Now I\'ll fill the login form and submit"). It is displayed in the in-page HUD and as a floating thought bubble so a human can follow along. Purely cosmetic — it performs no page action. Call it before a sequence of actions to make the run readable. Targets the default tab unless `tabId` is given.',
+    inputSchema: { message: z.string(), tabId: z.string().optional() },
+  },
+  async ({ message, tabId }) => json(await bridge.dispatch('think', { message }, tabOpts({ tabId, message })))
+);
+
+server.registerTool(
+  'status',
+  {
+    title: 'Show a status line (typed in the on-page bar)',
+    description:
+      'Type a short status into the persistent on-page status bar so a human can follow along. ' +
+      '`kind` sets the icon/intent: "thinking" (💭 internal reasoning), "code" (⌘ checking/reading code), "net" (⇅ network), or "action" (✦, default). ' +
+      'The message stays at least ~10s; if no newer status/action arrives it cycles gentle idle phrases. `dwellMs` overrides the hold time. Cosmetic only. Targets the default tab unless `tabId` is given.',
+    inputSchema: {
+      message: z.string(),
+      kind: z.enum(['thinking', 'code', 'net', 'action']).optional(),
+      dwellMs: z.number().int().optional(),
+      tabId: z.string().optional(),
+    },
+  },
+  async ({ message, kind, dwellMs, tabId }) =>
+    json(await bridge.dispatch('status', { message, kind, dwellMs }, tabOpts({ tabId, message })))
 );
 
 server.registerTool(
@@ -180,9 +309,9 @@ server.registerTool(
     title: 'Page overview (landmark map)',
     description:
       'Return the structural layout of the current page so you know the lay of the land: `header` (banner + its links/buttons), `nav` (navigation lists + items), `sidebars` (with items), `sections` (landmark regions by heading), `tabs` (tab lists + active tab), `headings` (h1–h3 outline), `footer` (+ items), and `openOverlays` (dialogs/menus currently open and possibly blocking). Use after navigating to understand where things are, then snapshot/find/click into a region. Targets the default tab unless `tabId` is given. Requires a connected tab.',
-    inputSchema: { tabId: z.string().optional() },
+    inputSchema: { tabId: z.string().optional(), ...MSG },
   },
-  async ({ tabId }) => json(await bridge.dispatch('overview', {}, { tabId: tabId ?? null }))
+  async ({ tabId, message }) => json(await bridge.dispatch('overview', {}, tabOpts({ tabId, message })))
 );
 
 server.registerTool(
@@ -192,10 +321,10 @@ server.registerTool(
     description:
       'Walk the React fiber tree of a tab and return the rendered components: a `summary` (each component name + instance count), a `tree` (name, nesting depth, and hook shape per instance), and totals. ' +
       'Pass `selector` to scope to one element\'s subtree. NOTE (React 19): source file/line and hook *names* are not available from fibers; hook shape (count, hasState, hasEffect) is inferred. Targets the default tab unless `tabId` is given. Requires a connected tab.',
-    inputSchema: { selector: z.string().optional(), tabId: z.string().optional() },
+    inputSchema: { selector: z.string().optional(), tabId: z.string().optional(), ...MSG },
   },
-  async ({ selector, tabId }) =>
-    json(await bridge.dispatch('components', selector ? { selector } : {}, { tabId: tabId ?? null }))
+  async ({ selector, tabId, message }) =>
+    json(await bridge.dispatch('components', selector ? { selector } : {}, tabOpts({ tabId, message })))
 );
 
 server.registerTool(
@@ -204,9 +333,9 @@ server.registerTool(
     title: 'Component owning an element',
     description:
       'Given a CSS selector, return the chain of React components that render that DOM element (nearest owner first), each with its hook shape. Targets the default tab unless `tabId` is given. Requires a connected tab.',
-    inputSchema: { selector: z.string(), tabId: z.string().optional() },
+    inputSchema: { selector: z.string(), tabId: z.string().optional(), ...MSG },
   },
-  async ({ selector, tabId }) => json(await bridge.dispatch('component_for', { selector }, { tabId: tabId ?? null }))
+  async ({ selector, tabId, message }) => json(await bridge.dispatch('component_for', { selector }, tabOpts({ tabId, message })))
 );
 
 server.registerTool(
@@ -215,9 +344,9 @@ server.registerTool(
     title: 'Force a component to re-render',
     description:
       'Force the nearest function component owning `selector` to re-render (dispatches its existing state with the same value, which React still schedules as a render). Returns ok:false if the component has no state hook to nudge. Targets the default tab unless `tabId` is given. Requires a connected tab.',
-    inputSchema: { selector: z.string(), tabId: z.string().optional() },
+    inputSchema: { selector: z.string(), tabId: z.string().optional(), ...MSG },
   },
-  async ({ selector, tabId }) => json(await bridge.dispatch('rerender', { selector }, { tabId: tabId ?? null }))
+  async ({ selector, tabId, message }) => json(await bridge.dispatch('rerender', { selector }, tabOpts({ tabId, message })))
 );
 
 server.registerTool(
@@ -233,12 +362,12 @@ server.registerTool(
       tabId: z.string().optional(),
     },
   },
-  async ({ selector, text, timeoutMs, tabId }) =>
+  async ({ selector, text, timeoutMs, tabId, message }) =>
     json(
       await bridge.dispatch(
         'wait_for',
         { selector, text, timeoutMs },
-        { timeoutMs: (timeoutMs || 5000) + 2000, tabId: tabId ?? null }
+        tabOpts({ tabId, message }, { timeoutMs: (timeoutMs || 5000) + 2000 })
       )
     )
 );
@@ -252,8 +381,8 @@ server.registerTool(
       'For a full-document load the overview reflects the page at call time — if it just unloaded, call `overview` again once it has loaded (use wait_for first). Targets the default tab unless `tabId` is given (or `all`).',
     inputSchema: { url: z.string(), ...TAB_TARGET },
   },
-  async ({ url, tabId, all }) =>
-    json(await bridge.dispatch('navigate', { url }, targetOpts({ tabId, all }, { timeoutMs: 8000 })))
+  async ({ url, tabId, all, message }) =>
+    json(await bridge.dispatch('navigate', { url }, targetOpts({ tabId, all, message }, { timeoutMs: 8000 })))
 );
 
 server.registerTool(
@@ -262,7 +391,7 @@ server.registerTool(
     title: 'Browser console logs',
     description:
       'Return ALL client-side console output (log, info, warn, error, debug) plus uncaught errors and unhandled promise rejections, forwarded by <AgentBridge/>. Each entry has {ts, level, message, tabId}. Pass `since` (an index) for deltas, or `tabId` to filter to one tab. Complements get_errors (server-side).',
-    inputSchema: { since: z.number().int().optional(), tabId: z.string().optional() },
+    inputSchema: { since: z.number().int().optional(), tabId: z.string().optional(), ...MSG },
   },
   async ({ since, tabId }) => json(bridge.consoleMessages({ since, tabId }))
 );
@@ -274,7 +403,7 @@ server.registerTool(
     description: 'Reload the current page in a tab. Pass `hard: true` to reload without the in-page hash. Targets the default tab unless `tabId` is given (or `all`).',
     inputSchema: { hard: z.boolean().optional(), ...TAB_TARGET },
   },
-  async ({ hard, tabId, all }) => json(await bridge.dispatch('reload', { hard: !!hard }, targetOpts({ tabId, all })))
+  async ({ hard, tabId, all, message }) => json(await bridge.dispatch('reload', { hard: !!hard }, targetOpts({ tabId, all, message })))
 );
 
 server.registerTool(
@@ -293,8 +422,8 @@ server.registerTool(
       tabId: z.string().optional(),
     },
   },
-  async ({ types, urlContains, since, limit, includeBodies, tabId }) =>
-    json(await bridge.dispatch('network_calls', { types, urlContains, since, limit, includeBodies }, { tabId: tabId ?? null }))
+  async ({ types, urlContains, since, limit, includeBodies, tabId, message }) =>
+    json(await bridge.dispatch('network_calls', { types, urlContains, since, limit, includeBodies }, tabOpts({ tabId, message })))
 );
 
 server.registerTool(
@@ -311,8 +440,8 @@ server.registerTool(
       ...TAB_TARGET,
     },
   },
-  async ({ area, action, key, value, tabId, all }) =>
-    json(await bridge.dispatch('storage', { area, action, key, value }, targetOpts({ tabId, all })))
+  async ({ area, action, key, value, tabId, all, message }) =>
+    json(await bridge.dispatch('storage', { area, action, key, value }, targetOpts({ tabId, all, message })))
 );
 
 server.registerTool(
@@ -323,8 +452,8 @@ server.registerTool(
       'Inspect or clear the browser Cache Storage in a tab. `action`: "list" (names + entry counts + sample urls) | "clear" (all, or a specific `name`). Targets the default tab unless `tabId` is given (or `all`).',
     inputSchema: { action: z.enum(['list', 'clear']).optional(), name: z.string().optional(), ...TAB_TARGET },
   },
-  async ({ action, name, tabId, all }) =>
-    json(await bridge.dispatch('cache', { action, name }, targetOpts({ tabId, all })))
+  async ({ action, name, tabId, all, message }) =>
+    json(await bridge.dispatch('cache', { action, name }, targetOpts({ tabId, all, message })))
 );
 
 server.registerTool(
@@ -333,9 +462,9 @@ server.registerTool(
     title: 'Run JS in the page (dev-only)',
     description:
       'Execute arbitrary JavaScript in the tab and return the serialized result. The snippet may `return` a value or be a single expression; promises are awaited. Result is JSON-serialized and size-capped. DEV-ONLY — use for inspecting app state, dispatching store actions, etc. Targets the default tab unless `tabId` is given.',
-    inputSchema: { code: z.string(), tabId: z.string().optional() },
+    inputSchema: { code: z.string(), tabId: z.string().optional(), ...MSG },
   },
-  async ({ code, tabId }) => json(await bridge.dispatch('eval', { code }, { tabId: tabId ?? null, timeoutMs: 15000 }))
+  async ({ code, tabId, message }) => json(await bridge.dispatch('eval', { code }, tabOpts({ tabId, message }, { timeoutMs: 15000 })))
 );
 
 server.registerTool(
@@ -344,10 +473,10 @@ server.registerTool(
     title: 'Screenshot the page (in-page capture)',
     description:
       'Capture a PNG screenshot of the tab (or an element via `selector`) using in-page html2canvas, returned as a data URL. Best-effort — there is no headless browser, so complex CSS may not render perfectly, and it needs network access to load html2canvas. Targets the default tab unless `tabId` is given.',
-    inputSchema: { selector: z.string().optional(), scale: z.number().optional(), tabId: z.string().optional() },
+    inputSchema: { selector: z.string().optional(), scale: z.number().optional(), tabId: z.string().optional(), ...MSG },
   },
-  async ({ selector, scale, tabId }) =>
-    json(await bridge.dispatch('screenshot', { selector, scale }, { tabId: tabId ?? null, timeoutMs: 20000 }))
+  async ({ selector, scale, tabId, message }) =>
+    json(await bridge.dispatch('screenshot', { selector, scale }, tabOpts({ tabId, message }, { timeoutMs: 20000 })))
 );
 
 server.registerTool(
@@ -362,8 +491,8 @@ server.registerTool(
       tabId: z.string().optional(),
     },
   },
-  async ({ query, in: scopes, tabId }) =>
-    json(await bridge.dispatch('find', { query, in: scopes }, { tabId: tabId ?? null }))
+  async ({ query, in: scopes, tabId, message }) =>
+    json(await bridge.dispatch('find', { query, in: scopes }, tabOpts({ tabId, message })))
 );
 
 async function main() {
