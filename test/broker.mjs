@@ -108,6 +108,33 @@ function client() {
   const freedNotice = ownTab.inbox.find((m) => m.t === 'released');
   ok(!!freedNotice, 'released tab is notified (goes back to unclaimed)');
 
+  // --- RELOAD: ag2 still owns c2.tabId. Simulate a page reload of that tab: close its socket, then
+  //     reconnect with the SAME tabId. It must restore ag2's ownership (not go unclaimed). ---
+  const owned2 = c2.tabId;
+  const tab2 = owned2 === idA ? tabA : tabB;
+  tab2.ws.close();
+  await sleep(150);
+  const reloaded = client(); await reloaded.open;
+  reloaded.send({ t: 'register', role: 'tab', tabId: owned2, url: 'http://x/reloaded', title: 'R' });
+  const reClaimed = await reloaded.waitFor((m) => m.t === 'claimed' && m.agentName === 'Agent Two');
+  ok(!!reClaimed, 'reloaded tab AUTO-RE-BINDS to its owner (ag2) — not unclaimed');
+  // ag2 can still command it after reload.
+  reloaded.inbox.length = 0;
+  ag2.send({ t: 'cmd', id: 9, tabId: owned2, op: 'snapshot', args: {} });
+  const afterReload = await reloaded.waitFor((m) => m.t === 'cmd' && m.id === 9);
+  ok(!!afterReload, 'owner can still command the tab after its reload');
+
+  // --- claim-by-match: open a free tab on /checkout; a fresh agent claims by match "checkout". ---
+  const tabC = client(); await tabC.open;
+  tabC.send({ t: 'register', role: 'tab', tabId: 'tabC', url: 'http://x/en/checkout', title: 'Checkout' });
+  await tabC.waitFor((m) => m.t === 'registered');
+  const ag4 = client(); await ag4.open;
+  ag4.send({ t: 'register', role: 'agent', agentId: 'ag4', name: 'Agent Four' });
+  await sleep(80);
+  ag4.send({ t: 'claim', match: 'checkout', intent: 'pay' });
+  const byMatch = await ag4.waitFor((m) => m.t === 'claimed');
+  ok(!!byMatch && byMatch.tabId === 'tabC', 'claim by url match picks the right free tab');
+
   console.log(failed === 0 ? '\nALL BROKER TESTS PASSED ✓' : `\n${failed} TEST(S) FAILED ✗`);
   process.exit(failed === 0 ? 0 : 1);
 })();

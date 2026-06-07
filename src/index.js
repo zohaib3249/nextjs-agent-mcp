@@ -18,8 +18,8 @@ const bridge = new AgentClient({ port: config.wsPort, agentId: config.agentId, n
 
 // Claim a tab for this agent: bind the first FREE tab; if none free, open a new tab (via any
 // existing tab) and bind that. `intent` is shown in the claimed tab's HUD. Returns the binding.
-async function claimTab({ intent = '', tabId = null } = {}) {
-  let res = await bridge.claim({ intent, tabId });
+async function claimTab({ intent = '', tabId = null, match = null } = {}) {
+  let res = await bridge.claim({ intent, tabId, match });
   if (res.ok) {
     if (intent) bridge.dispatch('status', { message: intent, kind: 'action' }, { timeoutMs: 4000 }).catch(() => {});
     return { ok: true, claimed: res.tabId, ...bridge.agentInfo() };
@@ -191,10 +191,10 @@ server.registerTool(
   {
     title: 'Claim a tab to control',
     description:
-      'Bind a browser tab to THIS agent so you can drive it. With no tabId, claims the first FREE (unclaimed) tab; if none are free, opens a new tab and claims that. Pass `tabId` to claim a specific one (must be free). `intent` is a short description of what you\'re about to do — it is shown in that tab\'s HUD so a human knows which agent controls it and why. **Call this before snapshot/click/fill/etc.**',
-    inputSchema: { intent: z.string().optional(), tabId: z.string().optional() },
+      'Bind a browser tab to THIS agent so you can drive it. Choose the tab per your need: pass `tabId` for a specific one (from list_tabs), or `match` to claim a free tab whose url/title contains that text (e.g. "checkout"), or neither to take the first free tab. If none are free, a new tab is opened and claimed. `intent` (shown in the tab\'s HUD) tells a human what you\'re doing. Ownership SURVIVES a page reload (the tab re-binds to you automatically). **Call this before snapshot/click/fill/etc.**',
+    inputSchema: { intent: z.string().optional(), tabId: z.string().optional(), match: z.string().optional() },
   },
-  async ({ intent, tabId }) => json(await claimTab({ intent: intent || '', tabId: tabId ?? null }))
+  async ({ intent, tabId, match }) => json(await claimTab({ intent: intent || '', tabId: tabId ?? null, match: match ?? null }))
 );
 
 server.registerTool(

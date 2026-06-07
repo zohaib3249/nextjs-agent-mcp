@@ -25,8 +25,8 @@ export class Broker {
     this.port = port;
     this.wss = null;
     this.agents = new Map(); // agentId -> ws
-    this.tabs = new Map(); // tabId -> ws
-    this.binding = new Map(); // tabId -> agentId (exclusive)
+    this.tabs = new Map(); // tabId -> ws (only currently-connected tabs)
+    this.binding = new Map(); // tabId -> { agentId, intent } (survives a tab reload)
     this._seq = 0;
   }
 
@@ -80,14 +80,14 @@ export class Broker {
       case 'result': {
         // From a tab → relay to the agent that owns it.
         const owner = this.binding.get(ws._meta.id);
-        const ag = owner && this.agents.get(owner);
+        const ag = owner && this.agents.get(owner.agentId);
         if (ag) this._send(ag, { t: 'result', id: m.id, ok: m.ok, value: m.value, error: m.error });
         return;
       }
       case 'console':
       case 'net': {
         const owner = this.binding.get(ws._meta.id);
-        const ag = owner && this.agents.get(owner);
+        const ag = owner && this.agents.get(owner.agentId);
         if (ag) this._send(ag, { t: 'event', kind: m.t, tabId: ws._meta.id, payload: m });
         return;
       }
@@ -112,6 +112,18 @@ export class Broker {
     ws._meta = { role: 'tab', id: tabId, url: m.url, pathname: m.pathname, title: m.title, userAgent: m.userAgent };
     this.tabs.set(tabId, ws);
     this._send(ws, { t: 'registered', role: 'tab', tabId });
+    // If this tabId was already bound (e.g. the tab just RELOADED), restore ownership so the page
+    // doesn't go back to "unclaimed". Re-notify the tab AND the owning agent.
+    const b = this.binding.get(tabId);
+    if (b) {
+      const ag = this.agents.get(b.agentId);
+      if (ag) {
+        this._send(ws, { t: 'claimed', agentId: b.agentId, agentName: ag._meta.name, intent: b.intent || '' });
+      } else {
+        // Owner gone while the tab was away → free it.
+        this.binding.delete(tabId);
+      }
+    }
     this._broadcastTabsToAgents();
   }
 
@@ -120,15 +132,21 @@ export class Broker {
     const agentId = ws._meta.id;
     let tabId = m.tabId;
     if (tabId) {
-      const owner = this.binding.get(tabId);
-      if (owner && owner !== agentId) return this._send(ws, { t: 'error', msg: `tab ${tabId} is owned by ${owner}` });
+      const b = this.binding.get(tabId);
+      if (b && b.agentId !== agentId) return this._send(ws, { t: 'error', msg: `tab ${tabId} is owned by ${b.agentId}` });
       if (!this.tabs.has(tabId)) return this._send(ws, { t: 'error', msg: `no tab ${tabId}` });
     } else {
-      // first FREE tab
-      tabId = [...this.tabs.keys()].find((id) => !this.binding.has(id));
+      // Pick a FREE (connected + unbound) tab. If `match` is given, prefer a free tab whose url or
+      // title contains it — so an agent can claim "the tab on /checkout" rather than any free one.
+      const free = [...this.tabs.entries()].filter(([id]) => !this.binding.has(id));
+      const match = (m.match || '').toLowerCase();
+      const pick =
+        (match && free.find(([, w]) => `${w._meta.url || ''} ${w._meta.title || ''}`.toLowerCase().includes(match))) ||
+        free[0];
+      tabId = pick ? pick[0] : undefined;
       if (!tabId) return this._send(ws, { t: 'needTab', msg: 'no free tab — open one' });
     }
-    this.binding.set(tabId, agentId);
+    this.binding.set(tabId, { agentId, intent: m.intent || '' });
     this._send(ws, { t: 'claimed', tabId });
     const tab = this.tabs.get(tabId);
     this._send(tab, { t: 'claimed', agentId, agentName: ws._meta.name, intent: m.intent || '' });
@@ -136,7 +154,8 @@ export class Broker {
   }
 
   _release(ws, tabId) {
-    if (this.binding.get(tabId) === ws._meta.id) {
+    const b = this.binding.get(tabId);
+    if (b && b.agentId === ws._meta.id) {
       this.binding.delete(tabId);
       const tab = this.tabs.get(tabId);
       if (tab) this._send(tab, { t: 'released' });
@@ -149,7 +168,7 @@ export class Broker {
     if (ws._meta.role !== 'agent') return;
     const agentId = ws._meta.id;
     const tabId = m.tabId;
-    if (this.binding.get(tabId) !== agentId) {
+    if (this.binding.get(tabId)?.agentId !== agentId) {
       return this._send(ws, { t: 'result', id: m.id, ok: false, error: `tab ${tabId} is not claimed by you (call claim_tab)` });
     }
     const tab = this.tabs.get(tabId);
@@ -161,17 +180,20 @@ export class Broker {
     const { role, id } = ws._meta || {};
     if (role === 'agent') {
       this.agents.delete(id);
-      // free any tabs this agent owned
-      for (const [tabId, owner] of [...this.binding]) {
-        if (owner === id) {
+      // free any tabs this agent owned (agent is truly gone)
+      for (const [tabId, b] of [...this.binding]) {
+        if (b.agentId === id) {
           this.binding.delete(tabId);
           const tab = this.tabs.get(tabId);
           if (tab) this._send(tab, { t: 'released' });
         }
       }
+      this._broadcastTabsToAgents();
     } else if (role === 'tab') {
+      // A tab disconnect is often just a RELOAD/navigation. Remove it from the live set, but KEEP
+      // its binding so the same tabId restores ownership when it reconnects a moment later.
+      // (The binding is cleared only if the OWNING AGENT disconnects, above.)
       this.tabs.delete(id);
-      this.binding.delete(id);
       this._broadcastTabsToAgents();
     }
   }
@@ -182,15 +204,18 @@ export class Broker {
   }
 
   tabList() {
-    return [...this.tabs.entries()].map(([tabId, ws]) => ({
-      tabId,
-      url: ws._meta.url,
-      pathname: ws._meta.pathname,
-      title: ws._meta.title,
-      boundAgentId: this.binding.get(tabId) || null,
-      boundAgentName: this.binding.has(tabId) ? this.agents.get(this.binding.get(tabId))?._meta.name || null : null,
-      free: !this.binding.has(tabId),
-    }));
+    return [...this.tabs.entries()].map(([tabId, ws]) => {
+      const b = this.binding.get(tabId);
+      return {
+        tabId,
+        url: ws._meta.url,
+        pathname: ws._meta.pathname,
+        title: ws._meta.title,
+        boundAgentId: b ? b.agentId : null,
+        boundAgentName: b ? this.agents.get(b.agentId)?._meta.name || b.agentId : null,
+        free: !b,
+      };
+    });
   }
 
   _mkTabId() {

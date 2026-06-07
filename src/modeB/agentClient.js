@@ -131,11 +131,12 @@ export class AgentClient {
     };
   }
 
-  // Claim a tab: a specific tabId, or the first free one. Returns {ok, tabId} | {ok:false, needTab|error}.
-  claim({ tabId = null, intent = '' } = {}) {
+  // Claim a tab: a specific tabId, a free tab matching `match` (url/title substring), or the first
+  // free one. Returns {ok, tabId} | {ok:false, needTab|error}.
+  claim({ tabId = null, intent = '', match = null } = {}) {
     return new Promise((resolve) => {
       this.claimWaiters.push(resolve);
-      this._send({ t: 'claim', tabId, intent });
+      this._send({ t: 'claim', tabId, intent, match });
       setTimeout(() => this._resolveClaim({ ok: false, error: 'claim timed out (is the broker up?)' }), 5000);
     });
   }

@@ -1,6 +1,6 @@
 {
   "name": "nextjs-agent-mcp",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "MCP server to drive and inspect a running Next.js app: headless route/error introspection + a real-event in-page browser bridge (click, fill, snapshot, React fiber tree, network, storage, eval) — no Playwright.",
   "type": "module",
   "license": "MIT",
