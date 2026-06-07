@@ -5,12 +5,12 @@ name: Publish to npm
 #   (npmjs.com → Access Tokens → Generate → "Automation"), then:
 #   Repo → Settings → Secrets and variables → Actions → New repository secret → NPM_TOKEN.
 
+# Fires on a published GitHub Release only. (Creating a release also creates the tag, so we don't
+# also listen on tag pushes — that would start two concurrent publishes of the same version, one
+# of which fails as a duplicate.)
 on:
   release:
     types: [published]
-  push:
-    tags:
-      - "v*"
 
 jobs:
   publish:
