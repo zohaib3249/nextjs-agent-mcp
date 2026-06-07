@@ -1,0 +1,6 @@
+{
+  "name": "nextjs-agent-mcp-bridge",
+  "private": true,
+  "main": "index.js",
+  "types": "index.d.ts"
+}

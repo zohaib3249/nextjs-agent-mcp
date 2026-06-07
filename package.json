@@ -1,0 +1,76 @@
+{
+  "name": "nextjs-agent-mcp",
+  "version": "0.1.0",
+  "description": "MCP server to drive and inspect a running Next.js app: headless route/error introspection + a real-event in-page browser bridge (click, fill, snapshot, React fiber tree, network, storage, eval) — no Playwright.",
+  "type": "module",
+  "license": "MIT",
+  "author": "zohaib3249",
+  "homepage": "https://github.com/zohaib3249/nextjs-agent-mcp#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/zohaib3249/nextjs-agent-mcp.git"
+  },
+  "bugs": {
+    "url": "https://github.com/zohaib3249/nextjs-agent-mcp/issues"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "nextjs",
+    "next",
+    "react",
+    "agent",
+    "ai",
+    "testing",
+    "browser",
+    "automation",
+    "introspection"
+  ],
+  "bin": {
+    "nextjs-agent-mcp": "src/index.js"
+  },
+  "exports": {
+    "./bridge": {
+      "types": "./bridge/index.d.ts",
+      "default": "./bridge/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "src",
+    "bridge",
+    "build.mjs",
+    "README.md",
+    "SPEC.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "node src/index.js --project ../my-app --ws-port 7333",
+    "build": "node build.mjs",
+    "test": "node test/bridge.mjs",
+    "prepare": "node build.mjs",
+    "prepublishOnly": "node build.mjs"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.4",
+    "ws": "^8.21.0"
+  },
+  "devDependencies": {
+    "esbuild": "^0.24.2"
+  },
+  "peerDependencies": {
+    "react": ">=18"
+  },
+  "peerDependenciesMeta": {
+    "react": {
+      "optional": true
+    }
+  }
+}
