@@ -6,13 +6,23 @@ no headless Chromium. It works two ways:
 - **Mode A — Headless introspection.** Reads the App Router route map and captures structured
   dev-server errors straight from the framework. No browser required.
 - **Mode B — In-page bridge.** A tiny dev-only `<AgentBridge/>` component you mount in your app
-  opens a WebSocket to the MCP. The agent can then click, fill, navigate, snapshot the page as a
-  structured model, walk the React component tree, capture network calls, read/write storage, run
-  JS, and screenshot — all via **real DOM events** in a real browser tab. A floating HUD lets you
-  watch the agent work.
+  connects to a small **broker** and the agent drives the page via **real DOM events** — click,
+  fill, navigate, snapshot the page as a structured model, walk the React component tree, capture
+  network calls, read/write storage, run JS, screenshot. A floating HUD lets you watch it work
+  (status bar with typed narration, traveling cursor, spotlight).
 
-Multi-tab aware: every connected tab gets a stable `tabId`; tools target the most-recent tab by
-default, a specific tab by `tabId`, or broadcast to `all`.
+### Connection model (broker + claim)
+Multiple agents and multiple tabs coexist cleanly:
+- A single **broker** owns the WS port (default `7333`). The first MCP to start spawns it; others
+  connect to it. (Fixes the old "two MCPs on different ports, agent drives the wrong tab" problem.)
+- Each MCP registers as an **agent** with a unique id + name.
+- Each browser tab connects but stays **inert ("unclaimed")** — no agent controls it until one
+  **claims** it. On claim, the tab's HUD shows the controlling agent's name + intent.
+- An agent controls **one tab at a time** (the one it claimed) and **cannot** touch a tab owned by
+  another agent. `claim_tab` binds a free tab — or opens a new one if none are free.
+
+**Agent loop:** `claim_tab({intent})` → `snapshot`/`find` → `fill`/`fill_form`/`click` →
+`wait_for` → `network_calls` → `release_tab`.
 
 ---
 
@@ -117,16 +127,21 @@ const nextConfig = { transpilePackages: ['nextjs-agent-mcp'] };
 | `get_errors` | Structured compile / module-not-found / runtime / hydration errors (`since` for deltas). |
 | `stop_dev_server` | Stop the spawned dev server. |
 
-### Mode B — in-page bridge (needs a connected tab)
+### Mode B — in-page bridge (claim a tab first)
 | Tool | What it does |
 |---|---|
-| `bridge_status` | Is the WS bridge listening? Any bind error? Which tabs are connected? |
-| `list_tabs` | Every connected tab: `tabId`, url, pathname, title + the `defaultTabId`. |
-| `open_tab` | An existing tab `window.open`s a new tab (which auto-connects with its own id). |
-| `navigate` / `reload` | Navigate a tab to a URL / reload it. |
-| `click` / `fill` | Real pointer+click / native-setter input so React & MUI handlers fire. |
+| `agent_info` | This agent's id/name, broker connection, and the tab it controls (`boundTabId`). |
+| `list_tabs` | All connected tabs: `tabId`, url, title, `free`, and `boundAgentName` if owned. |
+| `claim_tab` | **Call first.** Bind a free tab (or open one if none free). `intent` shows in the tab's HUD. |
+| `release_tab` | Unbind the tab → back to "unclaimed" for a human/other agent. |
+| `bridge_status` | This agent's broker status: connected?, port, bound tab, all tabs + owners. |
+| `open_tab` | Open a new browser tab (then claim it). |
+| `navigate` / `reload` | Navigate the bound tab to a URL / reload it. |
+| `click` / `fill` | Real pointer+click / **type-aware** input: text, `<select>` (value or label), checkbox/radio, date/time, contenteditable. |
+| `fill_form` | Fill MANY fields in one call (`[{selector,value}]`) — cursor walks each field. |
 | `snapshot` | Structured page model: `route`, `forms` (grouped + submit), `fields` (label/name/id/type/value/required/options/selector), `actions`, and a flat `values` map. |
 | `page_context` | Lightweight "where am I": url, pathname, locale, title, page heading. |
+| `overview` | Page landmark map: header / nav / sidebars / sections / tabs / footer / open dialogs. |
 | `find` | Search the page for fields/actions/components matching a query. |
 | `components` | Walk the React fiber tree: component names, nesting, hook shape. |
 | `component_for` | Which components render a given element (owner chain). |
@@ -136,15 +151,16 @@ const nextConfig = { transpilePackages: ['nextjs-agent-mcp'] };
 | `storage` | Read/modify `localStorage` / `sessionStorage` / cookies (get/set/delete/clear). |
 | `cache` | Inspect or clear Cache Storage (PWA/Service Worker). |
 | `console_messages` | All console output + uncaught errors / unhandled rejections (`since` for deltas). |
+| `think` / `status` | Narrate intent in the on-page status bar (kinds: 💭 thinking · ⌘ code · ⇅ net · ✦ action). |
 | `eval` | Run arbitrary JS in the page and return the serialized result (dev-only). |
 | `screenshot` | In-page PNG capture via html2canvas (best-effort; needs network to load html2canvas). |
 
-Most Mode-B tools accept an optional `tabId`; `navigate`/`reload`/`click`/`fill`/`storage`/`cache`
-also accept `all: true` to broadcast to every connected tab.
+Every Mode-B tool acts on the agent's **bound tab** and accepts an optional `message` (typed into
+the on-page status bar). Claim a tab with `claim_tab` before using them.
 
 ### A typical agent loop
-`page_context` → `snapshot` (or `find`) → `fill` a field by its selector → `click` submit →
-`wait_for` the result → `network_calls` / `console_messages` to verify.
+`claim_tab({intent})` → `page_context`/`overview` → `snapshot` (or `find`) → `fill_form` /
+`fill` / `click` → `wait_for` → `network_calls` / `console_messages` to verify → `release_tab`.
 
 ---
 
@@ -160,9 +176,8 @@ npm run dev > /tmp/dev.log 2>&1
 ## Test
 
 ```bash
-node test/bridge.mjs                          # WS round-trip with a fake bridge (no real browser)
-node test/smoke.mjs  /path/to/your-next-app   # boots over stdio, prints route_map
-node test/live.mjs   /path/to/your-next-app   # drives a REAL connected tab (open one first)
+npm test                                      # broker isolation test (agents+tabs, no browser)
+node test/smoke.mjs  /path/to/your-next-app   # boots over stdio, prints route_map (Mode A)
 ```
 
 ## Notes & caveats

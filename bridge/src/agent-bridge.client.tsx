@@ -250,6 +250,10 @@ export default function AgentBridge() {
   const [thinking, setThinking] = useState<string | null>(null);
   const [paused, setPaused] = useState(false);
   const [tabIdState, setTabIdState] = useState<string>(TAB_ID);
+  // Broker claim state: which agent (if any) currently controls this tab, + its stated intent.
+  const [owner, setOwner] = useState<{ name: string; intent: string } | null>(null);
+  const ownerRef = useRef<{ name: string; intent: string } | null>(null);
+  ownerRef.current = owner;
   // Start from deterministic defaults so SSR and the first client render match (no hydration
   // mismatch); load the real persisted prefs only after mount.
   const [prefs, setPrefs] = useState<Prefs>(DEFAULT_PREFS);
@@ -337,9 +341,11 @@ export default function AgentBridge() {
         opened = true;
         clearTimeout(tryNext);
         setStatus('connected');
+        // Broker protocol: register as a TAB. We stay INERT (no agent controls us) until claimed.
         ws!.send(
           JSON.stringify({
-            kind: 'hello',
+            t: 'register',
+            role: 'tab',
             tabId: TAB_ID,
             url: location.href,
             pathname: location.pathname,
@@ -347,27 +353,45 @@ export default function AgentBridge() {
             userAgent: navigator.userAgent,
           })
         );
-        // Show the persistent bottom status bar as soon as we connect.
-        if (prefsRef.current.fx) FX?.showBar('Agent connected — ready');
+        if (prefsRef.current.fx) FX?.showBar('Idle — unclaimed (open to agents)');
       };
 
       ws.onmessage = async (ev) => {
-        let cmd: Command;
+        let msg: { t?: string; [k: string]: unknown };
         try {
-          cmd = JSON.parse(ev.data);
+          msg = JSON.parse(ev.data);
         } catch {
           return;
         }
-        // Server resolved a duplicate id → adopt the unique one it assigned.
-        if ((cmd as { kind?: string }).kind === 'assignTabId') {
-          const newId = (cmd as unknown as { tabId?: string }).tabId;
-          if (newId) {
-            adoptTabId(newId);
-            setTabIdState(newId);
-          }
+        // Broker de-duped our id → adopt the unique one.
+        if (msg.t === 'assignTabId' && msg.tabId) {
+          adoptTabId(String(msg.tabId));
+          setTabIdState(String(msg.tabId));
           return;
         }
-        if (cmd.kind !== 'command') return;
+        if (msg.t === 'registered') return; // ack
+        // An agent claimed this tab — go active; show who + why.
+        if (msg.t === 'claimed') {
+          const o = { name: String(msg.agentName || 'agent'), intent: String(msg.intent || '') };
+          setOwner(o);
+          if (prefsRef.current.fx) FX?.showBar(`Controlled by ${o.name}${o.intent ? ' — ' + o.intent : ''}`);
+          return;
+        }
+        if (msg.t === 'released') {
+          setOwner(null);
+          if (prefsRef.current.fx) FX?.showBar('Idle — unclaimed (open to agents)');
+          return;
+        }
+        if (msg.t !== 'cmd') return;
+
+        // INERT guard: only execute commands when an agent owns this tab.
+        if (!ownerRef.current) {
+          send({ t: 'result', id: msg.id, ok: false, error: 'tab not claimed' });
+          return;
+        }
+
+        // Adapt broker `cmd` frame to the existing command shape.
+        const cmd: Command = { kind: 'command', id: msg.id as number, op: String(msg.op), args: (msg.args as Record<string, unknown>) || {}, message: (msg.message as string) ?? null };
 
         // The agent's narration for this call: explicit `message`, else the think arg, else a label.
         const narration = String(cmd.message ?? cmd.args?.message ?? '').slice(0, 300);
@@ -380,7 +404,7 @@ export default function AgentBridge() {
           const dwellMs = typeof cmd.args?.dwellMs === 'number' ? (cmd.args.dwellMs as number) : undefined;
           setThinking(msg);
           if (prefsRef.current.fx) FX?.say(msg, dwellMs, kind);
-          send({ kind: 'result', id: cmd.id, ok: true, value: { acknowledged: true } });
+          send({ t: 'result', id: cmd.id, ok: true, value: { acknowledged: true } });
           return;
         }
 
@@ -419,10 +443,10 @@ export default function AgentBridge() {
             }
           }
           if (prefsRef.current.fx) FX?.after(cmd);
-          send({ kind: 'result', id: cmd.id, ok: true, value });
+          send({ t: 'result', id: cmd.id, ok: true, value });
         } catch (err: unknown) {
           if (prefsRef.current.fx) FX?.fail(cmd);
-          send({ kind: 'result', id: cmd.id, ok: false, error: errMsg(err) });
+          send({ t: 'result', id: cmd.id, ok: false, error: errMsg(err) });
         } finally {
           setBusy(false);
         }
@@ -462,14 +486,14 @@ export default function AgentBridge() {
     for (const lvl of levels) {
       orig[lvl] = console[lvl];
       console[lvl] = (...a: unknown[]) => {
-        send({ kind: 'console', level: lvl, message: fmt(a) });
+        send({ t: 'console', level: lvl, message: fmt(a) });
         orig[lvl]!.apply(console, a as []);
       };
     }
     const onError = (e: ErrorEvent) =>
-      send({ kind: 'console', level: 'error', message: `Uncaught ${e.message} @ ${e.filename}:${e.lineno}` });
+      send({ t: 'console', level: 'error', message: `Uncaught ${e.message} @ ${e.filename}:${e.lineno}` });
     const onRejection = (e: PromiseRejectionEvent) =>
-      send({ kind: 'console', level: 'error', message: `Unhandled rejection: ${String(e.reason)}`.slice(0, 2000) });
+      send({ t: 'console', level: 'error', message: `Unhandled rejection: ${String(e.reason)}`.slice(0, 2000) });
     window.addEventListener('error', onError);
     window.addEventListener('unhandledrejection', onRejection);
 
@@ -502,6 +526,7 @@ export default function AgentBridge() {
         thinking={thinking}
         paused={paused}
         tabId={tabIdState}
+        owner={owner}
         prefs={prefs}
         onTogglePause={() => setPaused((p) => !p)}
         onToggleFx={() => setPrefs((p) => ({ ...p, fx: !p.fx }))}
@@ -1024,6 +1049,7 @@ function Hud(props: {
   thinking: string | null;
   paused: boolean;
   tabId: string;
+  owner: { name: string; intent: string } | null;
   prefs: Prefs;
   onTogglePause: () => void;
   onToggleFx: () => void;
@@ -1126,7 +1152,12 @@ function Hud(props: {
         </button>
       </div>
 
-      <div style={{ color: '#64748b', fontSize: 10, marginTop: 3 }}>{props.tabId}</div>
+      <div style={{ color: '#64748b', fontSize: 10, marginTop: 3, display: 'flex', gap: 6 }}>
+        <span>{props.tabId}</span>
+        <span style={{ marginLeft: 'auto', color: props.owner ? '#34d399' : '#eab308' }}>
+          {props.owner ? `▣ ${props.owner.name}` : '○ unclaimed'}
+        </span>
+      </div>
 
       {thinking && (
         <div

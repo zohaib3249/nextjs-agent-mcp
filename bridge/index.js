@@ -180,6 +180,9 @@ function AgentBridge() {
   const [thinking, setThinking] = useState(null);
   const [paused, setPaused] = useState(false);
   const [tabIdState, setTabIdState] = useState(TAB_ID);
+  const [owner, setOwner] = useState(null);
+  const ownerRef = useRef(null);
+  ownerRef.current = owner;
   const [prefs, setPrefs] = useState(DEFAULT_PREFS);
   const [mounted, setMounted] = useState(false);
   useEffect(() => {
@@ -250,7 +253,8 @@ function AgentBridge() {
         setStatus("connected");
         ws.send(
           JSON.stringify({
-            kind: "hello",
+            t: "register",
+            role: "tab",
             tabId: TAB_ID,
             url: location.href,
             pathname: location.pathname,
@@ -258,32 +262,46 @@ function AgentBridge() {
             userAgent: navigator.userAgent
           })
         );
-        if (prefsRef.current.fx) FX?.showBar("Agent connected \u2014 ready");
+        if (prefsRef.current.fx) FX?.showBar("Idle \u2014 unclaimed (open to agents)");
       };
       ws.onmessage = async (ev) => {
-        let cmd;
+        let msg;
         try {
-          cmd = JSON.parse(ev.data);
+          msg = JSON.parse(ev.data);
         } catch {
           return;
         }
-        if (cmd.kind === "assignTabId") {
-          const newId = cmd.tabId;
-          if (newId) {
-            adoptTabId(newId);
-            setTabIdState(newId);
-          }
+        if (msg.t === "assignTabId" && msg.tabId) {
+          adoptTabId(String(msg.tabId));
+          setTabIdState(String(msg.tabId));
           return;
         }
-        if (cmd.kind !== "command") return;
+        if (msg.t === "registered") return;
+        if (msg.t === "claimed") {
+          const o = { name: String(msg.agentName || "agent"), intent: String(msg.intent || "") };
+          setOwner(o);
+          if (prefsRef.current.fx) FX?.showBar(`Controlled by ${o.name}${o.intent ? " \u2014 " + o.intent : ""}`);
+          return;
+        }
+        if (msg.t === "released") {
+          setOwner(null);
+          if (prefsRef.current.fx) FX?.showBar("Idle \u2014 unclaimed (open to agents)");
+          return;
+        }
+        if (msg.t !== "cmd") return;
+        if (!ownerRef.current) {
+          send({ t: "result", id: msg.id, ok: false, error: "tab not claimed" });
+          return;
+        }
+        const cmd = { kind: "command", id: msg.id, op: String(msg.op), args: msg.args || {}, message: msg.message ?? null };
         const narration = String(cmd.message ?? cmd.args?.message ?? "").slice(0, 300);
         if (cmd.op === "think" || cmd.op === "status") {
-          const msg = narration;
+          const msg2 = narration;
           const kind = cmd.args?.kind || (cmd.op === "think" ? "thinking" : "action");
           const dwellMs = typeof cmd.args?.dwellMs === "number" ? cmd.args.dwellMs : void 0;
-          setThinking(msg);
-          if (prefsRef.current.fx) FX?.say(msg, dwellMs, kind);
-          send({ kind: "result", id: cmd.id, ok: true, value: { acknowledged: true } });
+          setThinking(msg2);
+          if (prefsRef.current.fx) FX?.say(msg2, dwellMs, kind);
+          send({ t: "result", id: cmd.id, ok: true, value: { acknowledged: true } });
           return;
         }
         if (pausedRef.current) {
@@ -316,10 +334,10 @@ function AgentBridge() {
             }
           }
           if (prefsRef.current.fx) FX?.after(cmd);
-          send({ kind: "result", id: cmd.id, ok: true, value });
+          send({ t: "result", id: cmd.id, ok: true, value });
         } catch (err) {
           if (prefsRef.current.fx) FX?.fail(cmd);
-          send({ kind: "result", id: cmd.id, ok: false, error: errMsg(err) });
+          send({ t: "result", id: cmd.id, ok: false, error: errMsg(err) });
         } finally {
           setBusy(false);
         }
@@ -349,12 +367,12 @@ function AgentBridge() {
     for (const lvl of levels) {
       orig[lvl] = console[lvl];
       console[lvl] = (...a) => {
-        send({ kind: "console", level: lvl, message: fmt(a) });
+        send({ t: "console", level: lvl, message: fmt(a) });
         orig[lvl].apply(console, a);
       };
     }
-    const onError = (e) => send({ kind: "console", level: "error", message: `Uncaught ${e.message} @ ${e.filename}:${e.lineno}` });
-    const onRejection = (e) => send({ kind: "console", level: "error", message: `Unhandled rejection: ${String(e.reason)}`.slice(0, 2e3) });
+    const onError = (e) => send({ t: "console", level: "error", message: `Uncaught ${e.message} @ ${e.filename}:${e.lineno}` });
+    const onRejection = (e) => send({ t: "console", level: "error", message: `Unhandled rejection: ${String(e.reason)}`.slice(0, 2e3) });
     window.addEventListener("error", onError);
     window.addEventListener("unhandledrejection", onRejection);
     connect();
@@ -385,6 +403,7 @@ function AgentBridge() {
         thinking,
         paused,
         tabId: tabIdState,
+        owner,
         prefs,
         onTogglePause: () => setPaused((p) => !p),
         onToggleFx: () => setPrefs((p) => ({ ...p, fx: !p.fx })),
@@ -909,7 +928,10 @@ function Hud(props) {
             ]
           }
         ),
-        /* @__PURE__ */ jsx("div", { style: { color: "#64748b", fontSize: 10, marginTop: 3 }, children: props.tabId }),
+        /* @__PURE__ */ jsxs("div", { style: { color: "#64748b", fontSize: 10, marginTop: 3, display: "flex", gap: 6 }, children: [
+          /* @__PURE__ */ jsx("span", { children: props.tabId }),
+          /* @__PURE__ */ jsx("span", { style: { marginLeft: "auto", color: props.owner ? "#34d399" : "#eab308" }, children: props.owner ? `\u25A3 ${props.owner.name}` : "\u25CB unclaimed" })
+        ] }),
         thinking && /* @__PURE__ */ jsxs(
           "div",
           {
