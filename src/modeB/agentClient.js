@@ -83,6 +83,7 @@ export class AgentClient {
     }
     if (m.t === 'claimed') {
       this.boundTabId = m.tabId;
+      if (m.name) this.name = m.name; // broker confirmed our (possibly new) display name
       this._resolveClaim({ ok: true, tabId: m.tabId });
       return;
     }
@@ -139,11 +140,11 @@ export class AgentClient {
   }
 
   // Claim a tab: a specific tabId, a free tab matching `match` (url/title substring), or the first
-  // free one. Returns {ok, tabId} | {ok:false, needTab|error}.
-  claim({ tabId = null, intent = '', match = null } = {}) {
+  // free one. `name` (optional) renames this agent. Returns {ok, tabId} | {ok:false, needTab|error}.
+  claim({ tabId = null, intent = '', match = null, name = null } = {}) {
     return new Promise((resolve) => {
       this.claimWaiters.push(resolve);
-      this._send({ t: 'claim', tabId, intent, match });
+      this._send({ t: 'claim', tabId, intent, match, name });
       setTimeout(() => this._resolveClaim({ ok: false, error: 'claim timed out (is the broker up?)' }), 5000);
     });
   }

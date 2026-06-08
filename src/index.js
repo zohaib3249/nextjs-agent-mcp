@@ -21,8 +21,8 @@ const bridge = new AgentClient({ port: config.wsPort, agentId: config.agentId, n
 
 // Claim a tab for this agent: bind the first FREE tab; if none free, open a new tab (via any
 // existing tab) and bind that. `intent` is shown in the claimed tab's HUD. Returns the binding.
-async function claimTab({ intent = '', tabId = null, match = null } = {}) {
-  let res = await bridge.claim({ intent, tabId, match });
+async function claimTab({ intent = '', tabId = null, match = null, name = null } = {}) {
+  let res = await bridge.claim({ intent, tabId, match, name });
   if (res.ok) {
     if (intent) bridge.dispatch('status', { message: intent, kind: 'action' }, { timeoutMs: 4000 }).catch(() => {});
     return { ok: true, claimed: res.tabId, ...bridge.agentInfo() };
@@ -47,7 +47,7 @@ async function claimTab({ intent = '', tabId = null, match = null } = {}) {
       await new Promise((r) => setTimeout(r, 50));
       if (bridge.tabs.some((t) => t.free)) break;
     }
-    res = await bridge.claim({ intent });
+    res = await bridge.claim({ intent, name });
     if (res.ok) {
       if (intent) bridge.dispatch('status', { message: intent, kind: 'action' }, { timeoutMs: 4000 }).catch(() => {});
       return { ok: true, claimed: res.tabId, opened: true, ...bridge.agentInfo() };
@@ -194,10 +194,11 @@ server.registerTool(
   {
     title: 'Claim a tab to control',
     description:
-      'Bind a browser tab to THIS agent so you can drive it. Choose the tab per your need: pass `tabId` for a specific one (from list_tabs), or `match` to claim a free tab whose url/title contains that text (e.g. "checkout"), or neither to take the first free tab. If none are free, a new tab is opened and claimed. `intent` (shown in the tab\'s HUD) tells a human what you\'re doing. Ownership SURVIVES a page reload (the tab re-binds to you automatically). **Call this before snapshot/click/fill/etc.**',
-    inputSchema: { intent: z.string().optional(), tabId: z.string().optional(), match: z.string().optional() },
+      'Bind a browser tab to THIS agent so you can drive it. Give yourself a clear `name` (e.g. "Checkout Bot") — it RENAMES this agent and is shown in the tab HUD + list_tabs so a human can tell agents apart. Choose the tab: `tabId` for a specific one, `match` for a free tab whose url/title contains text (e.g. "checkout"), or neither for the first free tab; if none are free a new tab is opened. `intent` (shown in the HUD) says what you\'re about to do. Ownership SURVIVES a page reload. **Call this before snapshot/click/fill/etc.**',
+    inputSchema: { name: z.string().optional(), intent: z.string().optional(), tabId: z.string().optional(), match: z.string().optional() },
   },
-  async ({ intent, tabId, match }) => json(await claimTab({ intent: intent || '', tabId: tabId ?? null, match: match ?? null }))
+  async ({ name, intent, tabId, match }) =>
+    json(await claimTab({ name: name ?? null, intent: intent || '', tabId: tabId ?? null, match: match ?? null }))
 );
 
 server.registerTool(

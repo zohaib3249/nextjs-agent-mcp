@@ -146,6 +146,13 @@ export class Broker {
   _claim(ws, m) {
     if (ws._meta.role !== 'agent') return this._send(ws, { t: 'error', msg: 'only agents can claim' });
     const agentId = ws._meta.id;
+    // Optional: the agent names itself at claim time. This RENAMES the whole agent (registry +
+    // all its tabs). Refresh the agents list shown to tabs.
+    let renamed = false;
+    if (m.name && m.name !== ws._meta.name) {
+      ws._meta.name = String(m.name).slice(0, 60);
+      renamed = true;
+    }
     let tabId = m.tabId;
     if (tabId) {
       if (this.locked.has(tabId)) return this._send(ws, { t: 'error', msg: `tab ${tabId} is under human control (user took over)` });
@@ -164,9 +171,19 @@ export class Broker {
       if (!tabId) return this._send(ws, { t: 'needTab', msg: 'no free tab — open one' });
     }
     this.binding.set(tabId, { agentId, intent: m.intent || '' });
-    this._send(ws, { t: 'claimed', tabId });
+    this._send(ws, { t: 'claimed', tabId, name: ws._meta.name });
     const tab = this.tabs.get(tabId);
     this._send(tab, { t: 'claimed', agentId, agentName: ws._meta.name, intent: m.intent || '' });
+    if (renamed) {
+      // Update the controller label on this agent's OTHER bound tabs too, and the agents list.
+      for (const [tid, b] of this.binding) {
+        if (b.agentId === agentId && tid !== tabId) {
+          const other = this.tabs.get(tid);
+          if (other) this._send(other, { t: 'claimed', agentId, agentName: ws._meta.name, intent: b.intent || '' });
+        }
+      }
+      this._broadcastAgentsToTabs();
+    }
     this._broadcastTabsToAgents();
   }
 

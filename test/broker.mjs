@@ -158,6 +158,14 @@ function client() {
   const reclaimed = await ag4.waitFor((m) => m.t === 'claimed');
   ok(!!reclaimed, 'after unlock, an agent can claim the tab again');
 
+  // --- claim with a NAME renames the agent; the tab's claimed notice carries it. ---
+  tabC.inbox.length = 0;
+  ag4.send({ t: 'claim', tabId: 'tabC', intent: 'pay', name: 'Checkout Bot' });
+  const named = await tabC.waitFor((m) => m.t === 'claimed' && m.agentName === 'Checkout Bot');
+  ok(!!named, 'claim with name → tab HUD shows the chosen agent name');
+  const agentsMsg = await tabC.waitFor((m) => m.t === 'agents' && (m.agents || []).some((a) => a.name === 'Checkout Bot'));
+  ok(!!agentsMsg, 'renamed agent appears in the agents list broadcast to tabs');
+
   console.log(failed === 0 ? '\nALL BROKER TESTS PASSED ✓' : `\n${failed} TEST(S) FAILED ✗`);
   process.exit(failed === 0 ? 0 : 1);
 })();
