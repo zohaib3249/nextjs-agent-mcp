@@ -13,10 +13,9 @@
 // Ships nothing to production. Port must match the MCP's --ws-port (default 7333).
 import { useEffect, useRef, useState } from 'react';
 
+// The broker lives on ONE fixed port (default 7333). All MCPs share it (first spawns it, others
+// connect as clients), and the tab connects ONLY here — no port scanning, so it never flaps.
 const WS_PORT = Number(process.env.NEXT_PUBLIC_AGENT_BRIDGE_PORT) || 7333;
-// The MCP auto-advances its WS port if the base is busy; the bridge scans the same range so it
-// still finds the server without manual reconfiguration.
-const WS_PORT_RANGE = 11;
 
 // Stable per-tab id that survives reloads of THIS tab but is unique per browser tab.
 //
@@ -272,6 +271,8 @@ export default function AgentBridge() {
   lockedRef.current = locked;
   // Brief "just claimed" intro animation flag.
   const [introAgent, setIntroAgent] = useState<{ name: string; intent: string } | null>(null);
+  // Names of agents currently connected to the broker (for the HUD).
+  const [agents, setAgents] = useState<string[]>([]);
   // A ref to the live WS send() so HUD buttons (take over / allow) can post to the broker.
   const sendRef = useRef<((o: unknown) => void) | null>(null);
   // Start from deterministic defaults so SSR and the first client render match (no hydration
@@ -332,34 +333,22 @@ export default function AgentBridge() {
     const waitWhilePaused = () =>
       pausedRef.current ? new Promise<void>((r) => resumeWaiters.current.push(r)) : Promise.resolve();
 
-    let portOffset = 0; // scans WS_PORT .. WS_PORT+RANGE-1, then wraps
+    // ONE broker on a FIXED port (default 7333). The first MCP spawns it; other MCPs connect to
+    // it as agents. The tab connects ONLY to this port — no range scanning — so it never flaps
+    // between ports. If the broker is down, we settle into a steady retry (no rapid cycling).
     const connect = () => {
       if (closed) return;
       setStatus('connecting');
-      const port = WS_PORT + (portOffset % WS_PORT_RANGE);
       let opened = false;
       try {
-        ws = new WebSocket(`ws://localhost:${port}`);
+        ws = new WebSocket(`ws://localhost:${WS_PORT}`);
       } catch {
-        portOffset++;
-        retry = setTimeout(connect, 400);
+        retry = setTimeout(connect, 2000);
         return;
       }
-      // If this port doesn't open quickly, advance to the next one in the range.
-      const tryNext = setTimeout(() => {
-        if (!opened) {
-          portOffset++;
-          try {
-            ws?.close();
-          } catch {
-            /* ignore */
-          }
-        }
-      }, 700);
 
       ws.onopen = () => {
         opened = true;
-        clearTimeout(tryNext);
         setStatus('connected');
         // Broker protocol: register as a TAB. We stay INERT (no agent controls us) until claimed.
         ws!.send(
@@ -390,6 +379,11 @@ export default function AgentBridge() {
           return;
         }
         if (msg.t === 'registered') return; // ack
+        if (msg.t === 'agents') {
+          const list = (msg.agents as Array<{ name: string }>) || [];
+          setAgents(list.map((a) => a.name));
+          return;
+        }
         // An agent claimed this tab — go active; show who + why + a brief takeover intro.
         if (msg.t === 'claimed') {
           const o = { name: String(msg.agentName || 'agent'), intent: String(msg.intent || '') };
@@ -491,7 +485,8 @@ export default function AgentBridge() {
                 results.push({ i, op: s.op, ok: false, error: e instanceof Error ? e.message : String(e) });
                 if (stopOnError) break;
               }
-              if (s.delayMs && i < steps.length - 1) await new Promise((r) => setTimeout(r, Math.min(60000, Math.max(0, s.delayMs))));
+              const d = typeof s.delayMs === 'number' ? Math.min(60000, Math.max(0, s.delayMs)) : 0;
+              if (d && i < steps.length - 1) await new Promise((r) => setTimeout(r, d));
             }
             value = { batch: true, total: steps.length, ran: results.length, ok: results.filter((r) => r.ok).length, results };
           } else {
@@ -507,13 +502,10 @@ export default function AgentBridge() {
       };
 
       ws.onclose = () => {
-        clearTimeout(tryNext);
         ws = null;
         setStatus('disconnected');
-        // If we never connected, advance through the range quickly; once we had a connection,
-        // back off a bit before rescanning from the same offset.
-        const delay = opened ? 1200 : 250;
-        if (!closed) retry = setTimeout(connect, delay);
+        // Steady retry on the SAME port (broker may be starting/restarting). No flapping.
+        if (!closed) retry = setTimeout(connect, opened ? 1200 : 2000);
       };
       ws.onerror = () => ws?.close();
     };
@@ -598,6 +590,8 @@ export default function AgentBridge() {
         paused={paused}
         tabId={tabIdState}
         owner={owner}
+        agents={agents}
+        port={WS_PORT}
         prefs={prefs}
         onTogglePause={() => setPaused((p) => !p)}
         onToggleFx={() => setPrefs((p) => ({ ...p, fx: !p.fx }))}
@@ -1274,6 +1268,8 @@ function Hud(props: {
   paused: boolean;
   tabId: string;
   owner: { name: string; intent: string } | null;
+  agents: string[];
+  port: number;
   prefs: Prefs;
   onTogglePause: () => void;
   onToggleFx: () => void;
@@ -1283,7 +1279,13 @@ function Hud(props: {
 }) {
   const { status, busy, thinking, paused, prefs } = props;
   const color = status === 'connected' ? '#22c55e' : status === 'connecting' ? '#eab308' : '#ef4444';
-  const label = status === 'connected' ? 'Agent connected' : status === 'connecting' ? 'Connecting…' : 'Agent offline';
+  // Clear, port-aware status — so you know exactly what's happening with the broker.
+  const label =
+    status === 'connected'
+      ? `broker :${props.port} ✓`
+      : status === 'connecting'
+        ? `connecting :${props.port}…`
+        : `broker :${props.port} offline`;
 
   const panelRef = useRef<HTMLDivElement | null>(null);
   const drag = useRef<{ dx: number; dy: number } | null>(null);
@@ -1382,6 +1384,12 @@ function Hud(props: {
           {props.owner ? `▣ ${props.owner.name}` : '○ unclaimed'}
         </span>
       </div>
+      {status === 'connected' && (
+        <div style={{ color: '#64748b', fontSize: 10, marginTop: 1 }}>
+          {props.agents.length} agent{props.agents.length === 1 ? '' : 's'} on broker
+          {props.agents.length ? `: ${props.agents.slice(0, 3).join(', ')}${props.agents.length > 3 ? '…' : ''}` : ''}
+        </div>
+      )}
 
       {thinking && (
         <div

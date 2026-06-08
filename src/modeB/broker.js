@@ -109,6 +109,7 @@ export class Broker {
       ws._meta = { role: 'agent', id: m.agentId, name: m.name || m.agentId };
       this.agents.set(m.agentId, ws);
       this._send(ws, { t: 'registered', role: 'agent', agentId: m.agentId });
+      this._broadcastAgentsToTabs(); // let tabs show how many agents are connected
       return;
     }
     // tab — de-dupe id (duplicated-tab inheritance), then register UNBOUND.
@@ -120,6 +121,7 @@ export class Broker {
     ws._meta = { role: 'tab', id: tabId, url: m.url, pathname: m.pathname, title: m.title, userAgent: m.userAgent };
     this.tabs.set(tabId, ws);
     this._send(ws, { t: 'registered', role: 'tab', tabId });
+    this._send(ws, { t: 'agents', agents: this._agentsInfo() }); // current agents on the broker
     // Human-locked across a reload → restore the "you're in control" state.
     if (this.locked.has(tabId)) this._send(ws, { t: 'lockedByUser' });
     // If this tabId was already bound (e.g. the tab just RELOADED), restore ownership so the page
@@ -227,6 +229,7 @@ export class Broker {
         }
       }
       this._broadcastTabsToAgents();
+      this._broadcastAgentsToTabs();
     } else if (role === 'tab') {
       // A tab disconnect is often just a RELOAD/navigation. Remove it from the live set, but KEEP
       // its binding so the same tabId restores ownership when it reconnects a moment later.
@@ -239,6 +242,16 @@ export class Broker {
   _broadcastTabsToAgents() {
     const tabs = this.tabList();
     for (const ag of this.agents.values()) this._send(ag, { t: 'tabs', tabs });
+  }
+
+  _agentsInfo() {
+    return [...this.agents.values()].map((a) => ({ agentId: a._meta.id, name: a._meta.name }));
+  }
+
+  // Tell every tab how many agents are on the broker (+ their names) — for the HUD.
+  _broadcastAgentsToTabs() {
+    const agents = this._agentsInfo();
+    for (const tab of this.tabs.values()) this._send(tab, { t: 'agents', agents });
   }
 
   tabList() {

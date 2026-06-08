@@ -7,7 +7,6 @@ var __publicField = (obj, key, value) => __defNormalProp(obj, typeof key !== "sy
 import { useEffect, useRef, useState } from "react";
 import { Fragment, jsx, jsxs } from "react/jsx-runtime";
 var WS_PORT = Number(process.env.NEXT_PUBLIC_AGENT_BRIDGE_PORT) || 7333;
-var WS_PORT_RANGE = 11;
 function rand() {
   try {
     const a = new Uint32Array(2);
@@ -196,6 +195,7 @@ function AgentBridge() {
   const lockedRef = useRef(false);
   lockedRef.current = locked;
   const [introAgent, setIntroAgent] = useState(null);
+  const [agents, setAgents] = useState([]);
   const sendRef = useRef(null);
   const [prefs, setPrefs] = useState(DEFAULT_PREFS);
   const [mounted, setMounted] = useState(false);
@@ -239,31 +239,18 @@ function AgentBridge() {
     let closed = false;
     let retry = null;
     const waitWhilePaused = () => pausedRef.current ? new Promise((r) => resumeWaiters.current.push(r)) : Promise.resolve();
-    let portOffset = 0;
     const connect = () => {
       if (closed) return;
       setStatus("connecting");
-      const port = WS_PORT + portOffset % WS_PORT_RANGE;
       let opened = false;
       try {
-        ws = new WebSocket(`ws://localhost:${port}`);
+        ws = new WebSocket(`ws://localhost:${WS_PORT}`);
       } catch {
-        portOffset++;
-        retry = setTimeout(connect, 400);
+        retry = setTimeout(connect, 2e3);
         return;
       }
-      const tryNext = setTimeout(() => {
-        if (!opened) {
-          portOffset++;
-          try {
-            ws?.close();
-          } catch {
-          }
-        }
-      }, 700);
       ws.onopen = () => {
         opened = true;
-        clearTimeout(tryNext);
         setStatus("connected");
         ws.send(
           JSON.stringify({
@@ -291,6 +278,11 @@ function AgentBridge() {
           return;
         }
         if (msg.t === "registered") return;
+        if (msg.t === "agents") {
+          const list = msg.agents || [];
+          setAgents(list.map((a) => a.name));
+          return;
+        }
         if (msg.t === "claimed") {
           const o = { name: String(msg.agentName || "agent"), intent: String(msg.intent || "") };
           setOwner(o);
@@ -378,7 +370,8 @@ function AgentBridge() {
                 results.push({ i, op: s.op, ok: false, error: e instanceof Error ? e.message : String(e) });
                 if (stopOnError) break;
               }
-              if (s.delayMs && i < steps.length - 1) await new Promise((r) => setTimeout(r, Math.min(6e4, Math.max(0, s.delayMs))));
+              const d = typeof s.delayMs === "number" ? Math.min(6e4, Math.max(0, s.delayMs)) : 0;
+              if (d && i < steps.length - 1) await new Promise((r) => setTimeout(r, d));
             }
             value = { batch: true, total: steps.length, ran: results.length, ok: results.filter((r) => r.ok).length, results };
           } else {
@@ -393,11 +386,9 @@ function AgentBridge() {
         }
       };
       ws.onclose = () => {
-        clearTimeout(tryNext);
         ws = null;
         setStatus("disconnected");
-        const delay = opened ? 1200 : 250;
-        if (!closed) retry = setTimeout(connect, delay);
+        if (!closed) retry = setTimeout(connect, opened ? 1200 : 2e3);
       };
       ws.onerror = () => ws?.close();
     };
@@ -468,6 +459,8 @@ function AgentBridge() {
         paused,
         tabId: tabIdState,
         owner,
+        agents,
+        port: WS_PORT,
         prefs,
         onTogglePause: () => setPaused((p) => !p),
         onToggleFx: () => setPrefs((p) => ({ ...p, fx: !p.fx })),
@@ -1041,7 +1034,7 @@ function shortSel(sel) {
 function Hud(props) {
   const { status, busy, thinking, paused, prefs } = props;
   const color = status === "connected" ? "#22c55e" : status === "connecting" ? "#eab308" : "#ef4444";
-  const label = status === "connected" ? "Agent connected" : status === "connecting" ? "Connecting\u2026" : "Agent offline";
+  const label = status === "connected" ? `broker :${props.port} \u2713` : status === "connecting" ? `connecting :${props.port}\u2026` : `broker :${props.port} offline`;
   const panelRef = useRef(null);
   const drag = useRef(null);
   const onHeaderPointerDown = (e) => {
@@ -1131,6 +1124,13 @@ function Hud(props) {
         /* @__PURE__ */ jsxs("div", { style: { color: "#64748b", fontSize: 10, marginTop: 3, display: "flex", gap: 6 }, children: [
           /* @__PURE__ */ jsx("span", { children: props.tabId }),
           /* @__PURE__ */ jsx("span", { style: { marginLeft: "auto", color: props.owner ? "#34d399" : "#eab308" }, children: props.owner ? `\u25A3 ${props.owner.name}` : "\u25CB unclaimed" })
+        ] }),
+        status === "connected" && /* @__PURE__ */ jsxs("div", { style: { color: "#64748b", fontSize: 10, marginTop: 1 }, children: [
+          props.agents.length,
+          " agent",
+          props.agents.length === 1 ? "" : "s",
+          " on broker",
+          props.agents.length ? `: ${props.agents.slice(0, 3).join(", ")}${props.agents.length > 3 ? "\u2026" : ""}` : ""
         ] }),
         thinking && /* @__PURE__ */ jsxs(
           "div",
