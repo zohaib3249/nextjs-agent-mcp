@@ -238,6 +238,24 @@ function AgentBridge() {
     let ws = null;
     let closed = false;
     let retry = null;
+    let inFlight = null;
+    let replied = /* @__PURE__ */ new Set();
+    const replyOnce = (id, ok, value, error) => {
+      if (replied.has(id)) return;
+      replied.add(id);
+      send({ t: "result", id, ok, value, error });
+    };
+    const onBeforeUnload = () => {
+      if (inFlight && !replied.has(inFlight.id)) {
+        try {
+          replyOnce(inFlight.id, true, { interruptedByNavigation: true, partial: inFlight.partial() });
+        } catch {
+          replyOnce(inFlight.id, true, { interruptedByNavigation: true });
+        }
+      }
+    };
+    window.addEventListener("beforeunload", onBeforeUnload);
+    window.addEventListener("pagehide", onBeforeUnload);
     const waitWhilePaused = () => pausedRef.current ? new Promise((r) => resumeWaiters.current.push(r)) : Promise.resolve();
     const connect = () => {
       if (closed) return;
@@ -350,12 +368,14 @@ function AgentBridge() {
         };
         setThinking(narration || actionLabel(cmd));
         setBusy(true);
+        const withTimeout = (p, ms, label) => Promise.race([p, new Promise((_, rej) => setTimeout(() => rej(new Error(`step "${label}" timed out after ${ms}ms`)), ms))]);
         try {
           let value;
           if (cmd.op === "batch") {
             const steps = cmd.args.steps || [];
             const stopOnError = cmd.args.stopOnError !== false;
             const results = [];
+            inFlight = { id: cmd.id, partial: () => ({ batch: true, total: steps.length, ran: results.length, results }) };
             for (let i = 0; i < steps.length; i++) {
               const s = steps[i];
               if (pausedRef.current) await waitWhilePaused();
@@ -363,25 +383,35 @@ function AgentBridge() {
                 results.push({ i, op: s.op, ok: false, error: "user took over (locked)" });
                 break;
               }
+              const navlike = s.op === "navigate" || s.op === "reload" || isLocationChangingEval(s);
               try {
-                const v = await execOne(String(s.op), s.args || {}, s.message || `step ${i + 1}/${steps.length}: ${actionLabel({ kind: "command", id: -1, op: s.op, args: s.args || {} })}`);
+                const stepMs = navlike ? 3e3 : 3e4;
+                const v = await withTimeout(
+                  Promise.resolve(execOne(String(s.op), s.args || {}, s.message || `step ${i + 1}/${steps.length}: ${actionLabel({ kind: "command", id: -1, op: s.op, args: s.args || {} })}`)),
+                  stepMs,
+                  s.op
+                );
                 results.push({ i, op: s.op, ok: true, value: v });
               } catch (e) {
-                results.push({ i, op: s.op, ok: false, error: e instanceof Error ? e.message : String(e) });
-                if (stopOnError) break;
+                const msg2 = e instanceof Error ? e.message : String(e);
+                results.push({ i, op: s.op, ok: navlike, value: navlike ? { navigating: true } : void 0, error: navlike ? void 0 : msg2 });
+                if (!navlike && stopOnError) break;
               }
               const d = typeof s.delayMs === "number" ? Math.min(6e4, Math.max(0, s.delayMs)) : 0;
               if (d && i < steps.length - 1) await new Promise((r) => setTimeout(r, d));
             }
             value = { batch: true, total: steps.length, ran: results.length, ok: results.filter((r) => r.ok).length, results };
           } else {
-            value = await execOne(cmd.op, cmd.args, narration || void 0);
+            inFlight = { id: cmd.id, partial: () => ({ interrupted: true }) };
+            const single = cmd.op === "navigate" || cmd.op === "reload";
+            value = await withTimeout(Promise.resolve(execOne(cmd.op, cmd.args, narration || void 0)), single ? 9e3 : 6e4, cmd.op);
           }
-          send({ t: "result", id: cmd.id, ok: true, value });
+          replyOnce(cmd.id, true, value);
         } catch (err) {
           if (prefsRef.current.fx) FX?.fail(cmd);
-          send({ t: "result", id: cmd.id, ok: false, error: errMsg(err) });
+          replyOnce(cmd.id, false, void 0, errMsg(err));
         } finally {
+          inFlight = null;
           setBusy(false);
         }
       };
@@ -424,6 +454,8 @@ function AgentBridge() {
       for (const lvl of levels) if (orig[lvl]) console[lvl] = orig[lvl];
       window.removeEventListener("error", onError);
       window.removeEventListener("unhandledrejection", onRejection);
+      window.removeEventListener("beforeunload", onBeforeUnload);
+      window.removeEventListener("pagehide", onBeforeUnload);
       ws?.close();
     };
   }, []);
@@ -972,6 +1004,11 @@ __publicField(_AgentFx, "IDLE_PHRASES", [
 ]);
 __publicField(_AgentFx, "MIN_DWELL_MS", 1e4);
 var AgentFx = _AgentFx;
+function isLocationChangingEval(s) {
+  if (s.op !== "eval") return false;
+  const code = String(s.args?.code || "");
+  return /location\s*\.\s*(href|assign|replace)|location\s*=|window\.location/.test(code);
+}
 function actionLabel(cmd) {
   const a = cmd.args || {};
   switch (cmd.op) {

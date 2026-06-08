@@ -329,6 +329,28 @@ export default function AgentBridge() {
     let closed = false;
     let retry: ReturnType<typeof setTimeout> | null = null;
 
+    // The currently-executing command. If a step navigates and unloads the page mid-run, the
+    // beforeunload handler flushes a partial result so the MCP never hangs waiting for a reply.
+    let inFlight: { id: number; partial: () => unknown } | null = null;
+    let replied = new Set<number>(); // ids we've already sent a result for
+    const replyOnce = (id: number, ok: boolean, value?: unknown, error?: string) => {
+      if (replied.has(id)) return;
+      replied.add(id);
+      send({ t: 'result', id, ok, value, error });
+    };
+    const onBeforeUnload = () => {
+      if (inFlight && !replied.has(inFlight.id)) {
+        // Page is unloading mid-command (a navigation step). Send what we have so dispatch resolves.
+        try {
+          replyOnce(inFlight.id, true, { interruptedByNavigation: true, partial: inFlight.partial() });
+        } catch {
+          replyOnce(inFlight.id, true, { interruptedByNavigation: true });
+        }
+      }
+    };
+    window.addEventListener('beforeunload', onBeforeUnload);
+    window.addEventListener('pagehide', onBeforeUnload);
+
     // Gate command execution while paused.
     const waitWhilePaused = () =>
       pausedRef.current ? new Promise<void>((r) => resumeWaiters.current.push(r)) : Promise.resolve();
@@ -467,36 +489,53 @@ export default function AgentBridge() {
 
         setThinking(narration || actionLabel(cmd));
         setBusy(true);
+        // Per-step watchdog: a single op that hangs (or whose page tears down) can't stall forever.
+        const withTimeout = <T,>(p: Promise<T>, ms: number, label: string): Promise<T> =>
+          Promise.race([p, new Promise<T>((_, rej) => setTimeout(() => rej(new Error(`step "${label}" timed out after ${ms}ms`)), ms))]);
         try {
           let value: unknown;
           if (cmd.op === 'batch') {
-            // Run multiple actions in sequence, each with optional per-step delay.
             const steps = (cmd.args.steps as Array<{ op: string; args?: Record<string, unknown>; delayMs?: number; message?: string }>) || [];
             const stopOnError = cmd.args.stopOnError !== false; // default: stop at first failure
             const results: Array<{ i: number; op: string; ok: boolean; value?: unknown; error?: string }> = [];
+            // Expose live partial results so beforeunload can flush them if a step navigates away.
+            inFlight = { id: cmd.id, partial: () => ({ batch: true, total: steps.length, ran: results.length, results }) };
             for (let i = 0; i < steps.length; i++) {
               const s = steps[i];
               if (pausedRef.current) await waitWhilePaused();
               if (lockedRef.current) { results.push({ i, op: s.op, ok: false, error: 'user took over (locked)' }); break; }
+              const navlike = s.op === 'navigate' || s.op === 'reload' || isLocationChangingEval(s);
               try {
-                const v = await execOne(String(s.op), s.args || {}, s.message || `step ${i + 1}/${steps.length}: ${actionLabel({ kind: 'command', id: -1, op: s.op, args: s.args || {} })}`);
+                // A navigating step may unload the page before it resolves — cap its wait short so
+                // we move on / let beforeunload flush, instead of hanging the whole batch.
+                const stepMs = navlike ? 3000 : 30000;
+                const v = await withTimeout(
+                  Promise.resolve(execOne(String(s.op), s.args || {}, s.message || `step ${i + 1}/${steps.length}: ${actionLabel({ kind: 'command', id: -1, op: s.op, args: s.args || {} })}`)),
+                  stepMs,
+                  s.op
+                );
                 results.push({ i, op: s.op, ok: true, value: v });
               } catch (e) {
-                results.push({ i, op: s.op, ok: false, error: e instanceof Error ? e.message : String(e) });
-                if (stopOnError) break;
+                const msg = e instanceof Error ? e.message : String(e);
+                // A timeout on a navigating step is expected (page unloaded) — record, don't fail hard.
+                results.push({ i, op: s.op, ok: navlike, value: navlike ? { navigating: true } : undefined, error: navlike ? undefined : msg });
+                if (!navlike && stopOnError) break;
               }
               const d = typeof s.delayMs === 'number' ? Math.min(60000, Math.max(0, s.delayMs)) : 0;
               if (d && i < steps.length - 1) await new Promise((r) => setTimeout(r, d));
             }
             value = { batch: true, total: steps.length, ran: results.length, ok: results.filter((r) => r.ok).length, results };
           } else {
-            value = await execOne(cmd.op, cmd.args, narration || undefined);
+            inFlight = { id: cmd.id, partial: () => ({ interrupted: true }) };
+            const single = cmd.op === 'navigate' || cmd.op === 'reload';
+            value = await withTimeout(Promise.resolve(execOne(cmd.op, cmd.args, narration || undefined)), single ? 9000 : 60000, cmd.op);
           }
-          send({ t: 'result', id: cmd.id, ok: true, value });
+          replyOnce(cmd.id, true, value);
         } catch (err: unknown) {
           if (prefsRef.current.fx) FX?.fail(cmd);
-          send({ t: 'result', id: cmd.id, ok: false, error: errMsg(err) });
+          replyOnce(cmd.id, false, undefined, errMsg(err));
         } finally {
+          inFlight = null;
           setBusy(false);
         }
       };
@@ -551,6 +590,8 @@ export default function AgentBridge() {
       for (const lvl of levels) if (orig[lvl]) console[lvl] = orig[lvl]!;
       window.removeEventListener('error', onError);
       window.removeEventListener('unhandledrejection', onRejection);
+      window.removeEventListener('beforeunload', onBeforeUnload);
+      window.removeEventListener('pagehide', onBeforeUnload);
       ws?.close();
     };
   }, []);
@@ -1193,6 +1234,14 @@ class AgentFx {
 }
 
 // Human-readable label for the spotlight tooltip.
+// Heuristic: does this batch step likely navigate the document (and thus unload the page)?
+// Catches eval that sets location, and clicks on submit-ish buttons can't be known, so only eval.
+function isLocationChangingEval(s: { op: string; args?: Record<string, unknown> }): boolean {
+  if (s.op !== 'eval') return false;
+  const code = String(s.args?.code || '');
+  return /location\s*\.\s*(href|assign|replace)|location\s*=|window\.location/.test(code);
+}
+
 function actionLabel(cmd: Command): string {
   const a = cmd.args || {};
   switch (cmd.op) {
