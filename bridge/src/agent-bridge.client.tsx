@@ -1094,7 +1094,12 @@ class AgentFx {
       tag === 'textarea' ||
       (node as HTMLElement).isContentEditable;
 
-    // Non-text controls (select, checkbox, radio, date…): no char animation — set + brief label.
+    // Composed widget (MUI Select/Autocomplete, Radix/shadcn combobox): open + pick the option.
+    if (isComposedWidget(node)) {
+      if (this.tip) this.tip.textContent = `Selecting "${String(value).slice(0, 24)}"`;
+      return doSelectOption(selector, value);
+    }
+    // Non-text native controls (select, checkbox, radio, date…): no char animation — set + label.
     if (!isTextLike) {
       const detail = setControlValue(node, value);
       if (this.tip) this.tip.textContent = detail;
@@ -1406,17 +1411,22 @@ async function run(op: string, args: Record<string, unknown>): Promise<unknown> 
       return doClick(String(args.selector));
     case 'fill':
       return doFill(String(args.selector), String(args.value ?? ''));
+    case 'select_option':
+      return doSelectOption(String(args.selector), String(args.value ?? ''));
+    case 'set_field':
+      return doSetField(String(args.selector), String(args.value ?? ''));
     case 'fill_form': {
-      // Non-animated batch fill (used when FX is off). Fills every field instantly.
+      // Non-animated batch fill (used when FX is off). Fills every field (awaits widget routing).
       const fields = (args.fields as Array<{ selector: string; value: string }>) || [];
-      const results = fields.map((f) => {
+      const results: Array<{ selector: string; ok: boolean; error?: string }> = [];
+      for (const f of fields) {
         try {
-          doFill(String(f.selector), String(f.value ?? ''));
-          return { selector: f.selector, ok: true };
+          await doFill(String(f.selector), String(f.value ?? ''));
+          results.push({ selector: f.selector, ok: true });
         } catch (e) {
-          return { selector: f.selector, ok: false, error: e instanceof Error ? e.message : String(e) };
+          results.push({ selector: f.selector, ok: false, error: e instanceof Error ? e.message : String(e) });
         }
-      });
+      }
       return { filledForm: true, total: fields.length, filled: results.filter((r) => r.ok).length, results };
     }
     case 'snapshot':
@@ -1797,6 +1807,58 @@ function setControlValue(node: HTMLElement, value: string): string {
   throw new Error(`Don't know how to fill <${tag}> — not a known input type`);
 }
 
+// ---- set_field: fill via the app's own state setter, not just the DOM ----------------------
+// For controlled React inputs (Formik, custom hooks) and form libs, the most reliable path is to
+// invoke the element's React `onChange` prop directly with a value-bearing event. We also try the
+// native-setter DOM fill so uncontrolled/RHF/MUI inputs update too. Reports which paths fired.
+function reactPropsOf(node: Element): Record<string, unknown> | null {
+  for (const k in node) {
+    if (k.startsWith('__reactProps$')) return (node as Record<string, unknown>)[k] as Record<string, unknown>;
+  }
+  return null;
+}
+function doSetField(selector: string, value: string): unknown {
+  const node = document.querySelector(selector) as (HTMLInputElement & HTMLElement) | null;
+  if (!node) throw new Error(`No element matches selector: ${selector}`);
+  const fired: string[] = [];
+
+  // 1) DOM native-setter + input/change (covers uncontrolled, React Hook Form, MUI controlled).
+  try {
+    node.focus?.();
+    if ('value' in node) {
+      nativeSet(node, 'value', value);
+      node.dispatchEvent(new Event('input', { bubbles: true }));
+      node.dispatchEvent(new Event('change', { bubbles: true }));
+      fired.push('dom-native-setter');
+    }
+  } catch {
+    /* ignore */
+  }
+
+  // 2) Call the element's React onChange prop directly (covers Formik / controlled handlers that
+  //    read e.target.value). We pass a synthetic-ish event pointing at the (already-updated) node.
+  const props = reactPropsOf(node);
+  if (props && typeof props.onChange === 'function') {
+    try {
+      (props.onChange as (e: unknown) => void)({
+        target: node,
+        currentTarget: node,
+        type: 'change',
+        bubbles: true,
+        preventDefault() {},
+        stopPropagation() {},
+        persist() {},
+      });
+      fired.push('react-onChange');
+    } catch (e) {
+      fired.push(`react-onChange-threw:${e instanceof Error ? e.message : 'err'}`);
+    }
+  }
+
+  if (!fired.length) throw new Error('Could not set field via DOM or React onChange.');
+  return { setField: selector, value, via: fired };
+}
+
 // Set a property via the element's native prototype setter so React's value-shadowing is bypassed.
 function nativeSet(node: HTMLElement, prop: 'value', v: string) {
   const tag = node.tagName.toLowerCase();
@@ -1828,9 +1890,102 @@ function normalizeDateValue(type: string, value: string): string {
 
 function doFill(selector: string, value: string) {
   const node = el(selector);
+  // Auto-route: native form controls go through setControlValue; composed widgets (MUI Select/
+  // Autocomplete, Radix/shadcn comboboxes — a div/button, not <input>/<select>) go through the
+  // open-and-pick path so the agent doesn't have to know which kind it is.
+  if (isComposedWidget(node)) {
+    return doSelectOption(selector, value);
+  }
   node.focus();
   const detail = setControlValue(node, value);
   return { filled: selector, value, detail };
+}
+
+// Is this a JS-composed widget (not a real native input/select/textarea/contenteditable)?
+function isComposedWidget(node: HTMLElement): boolean {
+  const tag = node.tagName.toLowerCase();
+  if (tag === 'input' || tag === 'textarea' || tag === 'select') return false;
+  if (node.isContentEditable) return false;
+  const role = node.getAttribute('role') || '';
+  if (/combobox|listbox|button|switch/.test(role)) return true;
+  // MUI Select / Autocomplete root or trigger
+  if (node.closest('.MuiSelect-root, .MuiAutocomplete-root, [class*="select" i], [data-radix-select-trigger], [data-state]')) return true;
+  // Anything that wraps a real control we can fall back to
+  return !node.querySelector('input, textarea, select');
+}
+
+// ---- select_option: open a composed dropdown/combobox and click the matching option -----------
+// Works with MUI Select, MUI Autocomplete, native-ish role=combobox/listbox, and Radix/shadcn.
+async function doSelectOption(selector: string, value: string): Promise<unknown> {
+  const trigger = document.querySelector(selector) as HTMLElement | null;
+  if (!trigger) throw new Error(`No element matches selector: ${selector}`);
+
+  // Autocomplete / combobox with a typeable inner input → type to filter first.
+  const innerInput =
+    (trigger.matches('input') ? trigger : trigger.querySelector('input')) ||
+    (trigger.closest('.MuiAutocomplete-root')?.querySelector('input') as HTMLInputElement | null);
+  if (innerInput && (innerInput.getAttribute('role') === 'combobox' || trigger.closest('.MuiAutocomplete-root'))) {
+    (innerInput as HTMLElement).focus();
+    const set = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set;
+    set?.call(innerInput, value);
+    innerInput.dispatchEvent(new Event('input', { bubbles: true }));
+    await wait(250);
+  } else {
+    // Open the popup: a real pointer sequence (MUI listens to mousedown; Radix to pointerdown/click).
+    openWidget(trigger);
+    await wait(120);
+  }
+
+  // Wait for option elements to appear (in a portal/popover anywhere in the document).
+  const opt = await waitForOption(value, 2500);
+  if (!opt) {
+    // Close any popup we opened, then report what WAS available to help the agent.
+    const avail = currentOptions().slice(0, 10).map((o) => optText(o));
+    throw new Error(`No option matching "${value}". Available: ${avail.join(' | ') || '(none visible)'}`);
+  }
+  // Click the option with a real sequence.
+  for (const t of ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click']) {
+    opt.dispatchEvent(new MouseEvent(t, { bubbles: true, cancelable: true, view: window }));
+  }
+  await wait(80);
+  return { selected: optText(opt), via: 'select_option', selector };
+}
+
+function openWidget(el: HTMLElement) {
+  el.scrollIntoView({ block: 'center' });
+  for (const t of ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click']) {
+    el.dispatchEvent(new MouseEvent(t, { bubbles: true, cancelable: true, view: window }));
+  }
+}
+const OPTION_SEL = '[role="option"], [role="listbox"] li, .MuiAutocomplete-option, .MuiMenuItem-root, [data-radix-collection-item]';
+function currentOptions(): HTMLElement[] {
+  return [...document.querySelectorAll(OPTION_SEL)].filter((o) => (o as HTMLElement).offsetParent !== null) as HTMLElement[];
+}
+function optText(o: Element): string {
+  return ((o as HTMLElement).getAttribute('aria-label') || o.textContent || '').trim();
+}
+function optMatches(o: HTMLElement, value: string): boolean {
+  const v = value.trim().toLowerCase();
+  const txt = optText(o).toLowerCase();
+  const dv = (o.getAttribute('data-value') || o.getAttribute('value') || '').toLowerCase();
+  return txt === v || dv === v;
+}
+async function waitForOption(value: string, timeoutMs: number): Promise<HTMLElement | null> {
+  const start = performance.now();
+  while (performance.now() - start < timeoutMs) {
+    const opts = currentOptions();
+    if (opts.length) {
+      const exact = opts.find((o) => optMatches(o, value));
+      if (exact) return exact;
+      const partial = opts.find((o) => optText(o).toLowerCase().includes(value.trim().toLowerCase()));
+      if (partial) return partial;
+    }
+    await wait(100);
+  }
+  return null;
+}
+function wait(ms: number) {
+  return new Promise((r) => setTimeout(r, ms));
 }
 
 function cssPath(node: Element): string {

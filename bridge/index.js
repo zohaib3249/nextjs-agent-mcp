@@ -826,6 +826,10 @@ var _AgentFx = class _AgentFx {
     const tag = node.tagName.toLowerCase();
     const type = tag === "input" ? (node.type || "text").toLowerCase() : tag;
     const isTextLike = tag === "input" && !["checkbox", "radio", "date", "datetime-local", "time", "month", "week", "file", "range", "color"].includes(type) || tag === "textarea" || node.isContentEditable;
+    if (isComposedWidget(node)) {
+      if (this.tip) this.tip.textContent = `Selecting "${String(value).slice(0, 24)}"`;
+      return doSelectOption(selector, value);
+    }
     if (!isTextLike) {
       const detail = setControlValue(node, value);
       if (this.tip) this.tip.textContent = detail;
@@ -1149,16 +1153,21 @@ async function run(op, args) {
       return doClick(String(args.selector));
     case "fill":
       return doFill(String(args.selector), String(args.value ?? ""));
+    case "select_option":
+      return doSelectOption(String(args.selector), String(args.value ?? ""));
+    case "set_field":
+      return doSetField(String(args.selector), String(args.value ?? ""));
     case "fill_form": {
       const fields = args.fields || [];
-      const results = fields.map((f) => {
+      const results = [];
+      for (const f of fields) {
         try {
-          doFill(String(f.selector), String(f.value ?? ""));
-          return { selector: f.selector, ok: true };
+          await doFill(String(f.selector), String(f.value ?? ""));
+          results.push({ selector: f.selector, ok: true });
         } catch (e) {
-          return { selector: f.selector, ok: false, error: e instanceof Error ? e.message : String(e) };
+          results.push({ selector: f.selector, ok: false, error: e instanceof Error ? e.message : String(e) });
         }
-      });
+      }
       return { filledForm: true, total: fields.length, filled: results.filter((r) => r.ok).length, results };
     }
     case "snapshot":
@@ -1475,6 +1484,49 @@ function setControlValue(node, value) {
   }
   throw new Error(`Don't know how to fill <${tag}> \u2014 not a known input type`);
 }
+function reactPropsOf(node) {
+  for (const k in node) {
+    if (k.startsWith("__reactProps$")) return node[k];
+  }
+  return null;
+}
+function doSetField(selector, value) {
+  const node = document.querySelector(selector);
+  if (!node) throw new Error(`No element matches selector: ${selector}`);
+  const fired = [];
+  try {
+    node.focus?.();
+    if ("value" in node) {
+      nativeSet(node, "value", value);
+      node.dispatchEvent(new Event("input", { bubbles: true }));
+      node.dispatchEvent(new Event("change", { bubbles: true }));
+      fired.push("dom-native-setter");
+    }
+  } catch {
+  }
+  const props = reactPropsOf(node);
+  if (props && typeof props.onChange === "function") {
+    try {
+      props.onChange({
+        target: node,
+        currentTarget: node,
+        type: "change",
+        bubbles: true,
+        preventDefault() {
+        },
+        stopPropagation() {
+        },
+        persist() {
+        }
+      });
+      fired.push("react-onChange");
+    } catch (e) {
+      fired.push(`react-onChange-threw:${e instanceof Error ? e.message : "err"}`);
+    }
+  }
+  if (!fired.length) throw new Error("Could not set field via DOM or React onChange.");
+  return { setField: selector, value, via: fired };
+}
 function nativeSet(node, prop, v) {
   const tag = node.tagName.toLowerCase();
   const proto = tag === "select" ? HTMLSelectElement.prototype : tag === "textarea" ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
@@ -1496,9 +1548,82 @@ function normalizeDateValue(type, value) {
 }
 function doFill(selector, value) {
   const node = el(selector);
+  if (isComposedWidget(node)) {
+    return doSelectOption(selector, value);
+  }
   node.focus();
   const detail = setControlValue(node, value);
   return { filled: selector, value, detail };
+}
+function isComposedWidget(node) {
+  const tag = node.tagName.toLowerCase();
+  if (tag === "input" || tag === "textarea" || tag === "select") return false;
+  if (node.isContentEditable) return false;
+  const role = node.getAttribute("role") || "";
+  if (/combobox|listbox|button|switch/.test(role)) return true;
+  if (node.closest('.MuiSelect-root, .MuiAutocomplete-root, [class*="select" i], [data-radix-select-trigger], [data-state]')) return true;
+  return !node.querySelector("input, textarea, select");
+}
+async function doSelectOption(selector, value) {
+  const trigger = document.querySelector(selector);
+  if (!trigger) throw new Error(`No element matches selector: ${selector}`);
+  const innerInput = (trigger.matches("input") ? trigger : trigger.querySelector("input")) || trigger.closest(".MuiAutocomplete-root")?.querySelector("input");
+  if (innerInput && (innerInput.getAttribute("role") === "combobox" || trigger.closest(".MuiAutocomplete-root"))) {
+    innerInput.focus();
+    const set = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set;
+    set?.call(innerInput, value);
+    innerInput.dispatchEvent(new Event("input", { bubbles: true }));
+    await wait(250);
+  } else {
+    openWidget(trigger);
+    await wait(120);
+  }
+  const opt = await waitForOption(value, 2500);
+  if (!opt) {
+    const avail = currentOptions().slice(0, 10).map((o) => optText(o));
+    throw new Error(`No option matching "${value}". Available: ${avail.join(" | ") || "(none visible)"}`);
+  }
+  for (const t of ["pointerdown", "mousedown", "pointerup", "mouseup", "click"]) {
+    opt.dispatchEvent(new MouseEvent(t, { bubbles: true, cancelable: true, view: window }));
+  }
+  await wait(80);
+  return { selected: optText(opt), via: "select_option", selector };
+}
+function openWidget(el2) {
+  el2.scrollIntoView({ block: "center" });
+  for (const t of ["pointerdown", "mousedown", "pointerup", "mouseup", "click"]) {
+    el2.dispatchEvent(new MouseEvent(t, { bubbles: true, cancelable: true, view: window }));
+  }
+}
+var OPTION_SEL = '[role="option"], [role="listbox"] li, .MuiAutocomplete-option, .MuiMenuItem-root, [data-radix-collection-item]';
+function currentOptions() {
+  return [...document.querySelectorAll(OPTION_SEL)].filter((o) => o.offsetParent !== null);
+}
+function optText(o) {
+  return (o.getAttribute("aria-label") || o.textContent || "").trim();
+}
+function optMatches(o, value) {
+  const v = value.trim().toLowerCase();
+  const txt = optText(o).toLowerCase();
+  const dv = (o.getAttribute("data-value") || o.getAttribute("value") || "").toLowerCase();
+  return txt === v || dv === v;
+}
+async function waitForOption(value, timeoutMs) {
+  const start = performance.now();
+  while (performance.now() - start < timeoutMs) {
+    const opts = currentOptions();
+    if (opts.length) {
+      const exact = opts.find((o) => optMatches(o, value));
+      if (exact) return exact;
+      const partial = opts.find((o) => optText(o).toLowerCase().includes(value.trim().toLowerCase()));
+      if (partial) return partial;
+    }
+    await wait(100);
+  }
+  return null;
+}
+function wait(ms) {
+  return new Promise((r) => setTimeout(r, ms));
 }
 function cssPath(node) {
   if (node.id) return `#${CSS.escape(node.id)}`;

@@ -260,8 +260,7 @@ server.registerTool(
   {
     title: 'Fill any input (type-aware)',
     description:
-      'Set the value of a form control, choosing the right strategy for its type: text/email/number/textarea (typed), `<select>` (match by option value OR visible label), checkbox/radio (true/false/on or value/label match), date/time (common formats normalized), contenteditable. Fires real input/change events so React & MUI register it. ' +
-      'Note: native `<select>` only — JS/MUI custom dropdowns (div-based) need click-to-open then click the option. Requires a connected tab.',
+      'Set the value of a form control, choosing the right strategy automatically: text/email/number/textarea (typed via React native setter), `<select>` (match by value or visible label), checkbox/radio, date/time, contenteditable — AND composed widgets (MUI Select/Autocomplete, Radix/shadcn dropdowns) which it opens-and-picks. Fires real input/change events so React & MUI register the change. Requires a connected tab.',
     inputSchema: { selector: z.string(), value: z.string(), ...MSG },
   },
   async ({ selector, value, message }) =>
@@ -274,7 +273,8 @@ server.registerTool(
     title: 'Fill multiple fields in one call',
     description:
       'Fill an entire form in a SINGLE call: pass `fields` as an array of {selector, value}. The bridge fills them one-by-one (cursor travels to each field + types it), so it stays visibly "controlled" but avoids a round-trip per field. ' +
-      'Get the selectors from snapshot/find (use each field\'s `selector`). Returns per-field results.',
+      'Each field is filled type-aware — text/number, native select/checkbox/radio/date, AND composed widgets (MUI Select/Autocomplete, Radix/shadcn dropdowns) are auto-detected and opened-then-picked. ' +
+      'Get the selectors from snapshot/find. Returns per-field results.',
     inputSchema: {
       fields: z.array(z.object({ selector: z.string(), value: z.string() })),
       ...MSG,
@@ -282,6 +282,30 @@ server.registerTool(
   },
   async ({ fields, message }) =>
     json(await bridge.dispatch('fill_form', { fields }, opts({ message }, { timeoutMs: 60000 })))
+);
+
+server.registerTool(
+  'select_option',
+  {
+    title: 'Pick an option in a dropdown/combobox',
+    description:
+      'Open a composed dropdown/combobox and select the option matching `value` (by visible text — exact then contains — or its data-value/value). Handles MUI `Select` & `Autocomplete`, Radix/shadcn comboboxes, and any role=combobox/listbox — i.e. the dropdowns that are NOT a native `<select>`. For Autocomplete it types `value` to filter first. (`fill`/`fill_form` auto-route here when the target is such a widget, so you usually don\'t need to call this directly — but use it when you want to be explicit.) Returns the selected option text, or lists available options if none matched.',
+    inputSchema: { selector: z.string(), value: z.string(), ...MSG },
+  },
+  async ({ selector, value, message }) =>
+    json(await bridge.dispatch('select_option', { selector, value }, opts({ message }, { timeoutMs: 12000 })))
+);
+
+server.registerTool(
+  'set_field',
+  {
+    title: 'Set a field via React state (not just DOM)',
+    description:
+      'Fill a controlled input by BOTH the DOM native setter (input/change events — covers React Hook Form, MUI, uncontrolled) AND by invoking the element\'s React `onChange` prop directly (covers Formik and custom controlled handlers that read e.target.value). Use this when a normal `fill` does not "stick" because the component is heavily controlled. Returns which paths fired (`dom-native-setter`, `react-onChange`). For app stores (Redux) or form-lib APIs not on the element, use `eval` to call them directly.',
+    inputSchema: { selector: z.string(), value: z.string(), ...MSG },
+  },
+  async ({ selector, value, message }) =>
+    json(await bridge.dispatch('set_field', { selector, value }, opts({ message })))
 );
 
 server.registerTool(
