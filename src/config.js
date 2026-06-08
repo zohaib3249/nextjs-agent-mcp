@@ -1,7 +1,7 @@
 // Parse CLI args / env into a config object shared across the server.
 //   --project <path>   absolute path to the Next.js app root (has package.json + src/app or app)
 //   --ws-port <port>   WebSocket port for the Mode-B bridge (Phase 2)
-import { resolve } from 'node:path';
+import { resolve, basename } from 'node:path';
 
 export function loadConfig(argv = process.argv.slice(2)) {
   const opts = {};
@@ -20,8 +20,11 @@ export function loadConfig(argv = process.argv.slice(2)) {
   // Optional local HTTP control endpoint (debug/automation): POST /op {op,args}. Off unless set.
   const httpPort = opts.httpPort || Number(process.env.NEXTJS_MCP_HTTP_PORT) || 0;
   // Identity for the broker registry: a human-readable name + a process-unique id.
-  const agentName = opts.agentName || process.env.NEXTJS_MCP_AGENT_NAME || 'agent';
+  // Default name is DISTINCT per instance so the HUD never shows "agent, agent, agent":
+  // "<project-folder>-<pid>" (e.g. "ecom-fe-48211"). Override with --agent-name / env.
+  const shortId = (Math.random().toString(36).slice(2, 6) + (process.pid % 1000)).slice(0, 5);
   const agentId = 'ag-' + Math.random().toString(36).slice(2, 8) + '-' + (process.pid % 100000);
+  const agentName = opts.agentName || process.env.NEXTJS_MCP_AGENT_NAME || `${basename(project) || 'agent'}-${shortId}`;
   // Chrome DevTools Protocol control (optional): manage real browser profiles/tabs.
   const chromePort = opts.chromePort || Number(process.env.NEXTJS_MCP_CHROME_PORT) || 9222;
   const chromePath = opts.chromePath || process.env.CHROME_PATH || null;
