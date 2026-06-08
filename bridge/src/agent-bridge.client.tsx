@@ -266,8 +266,10 @@ export default function AgentBridge() {
   const [owner, setOwner] = useState<{ name: string; intent: string } | null>(null);
   const ownerRef = useRef<{ name: string; intent: string } | null>(null);
   ownerRef.current = owner;
-  // User-takeover lock: when true, the human is in control and agents can't claim this tab.
+  // User-takeover lock: when true, the human is in control and agents can't claim/drive this tab.
   const [locked, setLocked] = useState(false);
+  const lockedRef = useRef(false);
+  lockedRef.current = locked;
   // Brief "just claimed" intro animation flag.
   const [introAgent, setIntroAgent] = useState<{ name: string; intent: string } | null>(null);
   // A ref to the live WS send() so HUD buttons (take over / allow) can post to the broker.
@@ -419,7 +421,11 @@ export default function AgentBridge() {
         }
         if (msg.t !== 'cmd') return;
 
-        // INERT guard: only execute commands when an agent owns this tab.
+        // INERT guard: refuse commands if the user took over (locked) or no agent owns the tab.
+        if (lockedRef.current) {
+          send({ t: 'result', id: msg.id, ok: false, error: 'user has taken over this tab (locked)' });
+          return;
+        }
         if (!ownerRef.current) {
           send({ t: 'result', id: msg.id, ok: false, error: 'tab not claimed' });
           return;
@@ -448,36 +454,49 @@ export default function AgentBridge() {
           await waitWhilePaused();
         }
 
+        // Execute ONE op with full FX (cursor/spotlight/typewriter). Shared by single cmd + batch.
+        const execOne = async (op: string, args: Record<string, unknown>, note?: string): Promise<unknown> => {
+          const c: Command = { kind: 'command', id: -1, op, args, message: note ?? null };
+          if (prefsRef.current.fx) {
+            if (note || op !== 'batch') FX?.say(note || actionLabel(c));
+            if (op === 'fill_form' && FX) {
+              return FX.fillForm((args.fields as Array<{ selector: string; value: string }>) || [], note);
+            }
+            await FX?.before(c);
+            if (op === 'fill' && FX) return FX.typeFill(String(args.selector), String(args.value ?? ''));
+            const v = await run(op, args);
+            FX?.after(c);
+            return v;
+          }
+          return run(op, args);
+        };
+
         setThinking(narration || actionLabel(cmd));
         setBusy(true);
         try {
           let value: unknown;
-          if (prefsRef.current.fx) {
-            // Type the agent's narration (or a friendly phrase) in the unified toast, then act.
-            FX?.say(narration || actionLabel(cmd));
-            // fill_form: walk each field like a person — cursor travels, spotlight, fast typewriter.
-            if (cmd.op === 'fill_form' && FX) {
-              value = await FX.fillForm(
-                (cmd.args.fields as Array<{ selector: string; value: string }>) || [],
-                narration
-              );
-            } else {
-              await FX?.before(cmd);
-              if (cmd.op === 'fill' && FX) {
-                value = await FX.typeFill(String(cmd.args.selector), String(cmd.args.value ?? ''));
-              } else {
-                value = await run(cmd.op, cmd.args);
+          if (cmd.op === 'batch') {
+            // Run multiple actions in sequence, each with optional per-step delay.
+            const steps = (cmd.args.steps as Array<{ op: string; args?: Record<string, unknown>; delayMs?: number; message?: string }>) || [];
+            const stopOnError = cmd.args.stopOnError !== false; // default: stop at first failure
+            const results: Array<{ i: number; op: string; ok: boolean; value?: unknown; error?: string }> = [];
+            for (let i = 0; i < steps.length; i++) {
+              const s = steps[i];
+              if (pausedRef.current) await waitWhilePaused();
+              if (lockedRef.current) { results.push({ i, op: s.op, ok: false, error: 'user took over (locked)' }); break; }
+              try {
+                const v = await execOne(String(s.op), s.args || {}, s.message || `step ${i + 1}/${steps.length}: ${actionLabel({ kind: 'command', id: -1, op: s.op, args: s.args || {} })}`);
+                results.push({ i, op: s.op, ok: true, value: v });
+              } catch (e) {
+                results.push({ i, op: s.op, ok: false, error: e instanceof Error ? e.message : String(e) });
+                if (stopOnError) break;
               }
+              if (s.delayMs && i < steps.length - 1) await new Promise((r) => setTimeout(r, Math.min(60000, Math.max(0, s.delayMs))));
             }
+            value = { batch: true, total: steps.length, ran: results.length, ok: results.filter((r) => r.ok).length, results };
           } else {
-            // FX off: fill_form still fills every field, just without animation.
-            if (cmd.op === 'fill_form') {
-              value = await run('fill_form', cmd.args);
-            } else {
-              value = await run(cmd.op, cmd.args);
-            }
+            value = await execOne(cmd.op, cmd.args, narration || undefined);
           }
-          if (prefsRef.current.fx) FX?.after(cmd);
           send({ t: 'result', id: cmd.id, ok: true, value });
         } catch (err: unknown) {
           if (prefsRef.current.fx) FX?.fail(cmd);
@@ -548,8 +567,20 @@ export default function AgentBridge() {
   // (sessionStorage tab id, localStorage prefs), so SSR output would never match the client.
   if (!mounted) return null;
 
-  const takeOver = () => sendRef.current?.({ t: 'takeover' });
-  const allowAgents = () => sendRef.current?.({ t: 'allowAgents' });
+  // Take over: act LOCALLY at once (hide control UI, go inert, lock) so the user sees instant
+  // effect even if the broker is slow/old — then tell the broker to release+lock authoritatively.
+  const takeOver = () => {
+    setOwner(null);
+    setIntroAgent(null);
+    setLocked(true);
+    if (prefsRef.current.fx) FX?.showBar("You're in control — agents are blocked");
+    sendRef.current?.({ t: 'takeover' });
+  };
+  const allowAgents = () => {
+    setLocked(false);
+    if (prefsRef.current.fx) FX?.showBar('Idle — unclaimed (open to agents)');
+    sendRef.current?.({ t: 'allowAgents' });
+  };
 
   return (
     <>

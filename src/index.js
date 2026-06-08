@@ -309,6 +309,29 @@ server.registerTool(
 );
 
 server.registerTool(
+  'batch',
+  {
+    title: 'Run multiple actions in sequence',
+    description:
+      'Execute several actions in ONE call, in order, each animated like a real user. `steps` is an array of {op, args, delayMs?, message?} where `op` is any single-tab action (click, fill, select_option, set_field, navigate, wait_for, scroll, etc.) and `delayMs` waits AFTER that step before the next. By default it stops at the first failure (`stopOnError: false` to keep going). Returns per-step results. Great for multi-click / multi-fill flows without a round-trip per action.',
+    inputSchema: {
+      steps: z.array(
+        z.object({
+          op: z.string(),
+          args: z.record(z.any()).optional(),
+          delayMs: z.number().int().optional(),
+          message: z.string().optional(),
+        })
+      ),
+      stopOnError: z.boolean().optional(),
+      ...MSG,
+    },
+  },
+  async ({ steps, stopOnError, message }) =>
+    json(await bridge.dispatch('batch', { steps, stopOnError }, opts({ message }, { timeoutMs: 120000 })))
+);
+
+server.registerTool(
   'snapshot',
   {
     title: 'Page snapshot (structured page model)',

@@ -17,6 +17,7 @@ export const OPS = Object.freeze({
   FILL_FORM: 'fill_form',
   SELECT_OPTION: 'select_option',
   SET_FIELD: 'set_field',
+  BATCH: 'batch',
   SNAPSHOT: 'snapshot',
   PAGE_CONTEXT: 'page_context',
   OVERVIEW: 'overview',

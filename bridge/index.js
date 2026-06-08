@@ -193,6 +193,8 @@ function AgentBridge() {
   const ownerRef = useRef(null);
   ownerRef.current = owner;
   const [locked, setLocked] = useState(false);
+  const lockedRef = useRef(false);
+  lockedRef.current = locked;
   const [introAgent, setIntroAgent] = useState(null);
   const sendRef = useRef(null);
   const [prefs, setPrefs] = useState(DEFAULT_PREFS);
@@ -317,6 +319,10 @@ function AgentBridge() {
           return;
         }
         if (msg.t !== "cmd") return;
+        if (lockedRef.current) {
+          send({ t: "result", id: msg.id, ok: false, error: "user has taken over this tab (locked)" });
+          return;
+        }
         if (!ownerRef.current) {
           send({ t: "result", id: msg.id, ok: false, error: "tab not claimed" });
           return;
@@ -335,33 +341,49 @@ function AgentBridge() {
         if (pausedRef.current) {
           await waitWhilePaused();
         }
+        const execOne = async (op, args, note) => {
+          const c = { kind: "command", id: -1, op, args, message: note ?? null };
+          if (prefsRef.current.fx) {
+            if (note || op !== "batch") FX?.say(note || actionLabel(c));
+            if (op === "fill_form" && FX) {
+              return FX.fillForm(args.fields || [], note);
+            }
+            await FX?.before(c);
+            if (op === "fill" && FX) return FX.typeFill(String(args.selector), String(args.value ?? ""));
+            const v = await run(op, args);
+            FX?.after(c);
+            return v;
+          }
+          return run(op, args);
+        };
         setThinking(narration || actionLabel(cmd));
         setBusy(true);
         try {
           let value;
-          if (prefsRef.current.fx) {
-            FX?.say(narration || actionLabel(cmd));
-            if (cmd.op === "fill_form" && FX) {
-              value = await FX.fillForm(
-                cmd.args.fields || [],
-                narration
-              );
-            } else {
-              await FX?.before(cmd);
-              if (cmd.op === "fill" && FX) {
-                value = await FX.typeFill(String(cmd.args.selector), String(cmd.args.value ?? ""));
-              } else {
-                value = await run(cmd.op, cmd.args);
+          if (cmd.op === "batch") {
+            const steps = cmd.args.steps || [];
+            const stopOnError = cmd.args.stopOnError !== false;
+            const results = [];
+            for (let i = 0; i < steps.length; i++) {
+              const s = steps[i];
+              if (pausedRef.current) await waitWhilePaused();
+              if (lockedRef.current) {
+                results.push({ i, op: s.op, ok: false, error: "user took over (locked)" });
+                break;
               }
+              try {
+                const v = await execOne(String(s.op), s.args || {}, s.message || `step ${i + 1}/${steps.length}: ${actionLabel({ kind: "command", id: -1, op: s.op, args: s.args || {} })}`);
+                results.push({ i, op: s.op, ok: true, value: v });
+              } catch (e) {
+                results.push({ i, op: s.op, ok: false, error: e instanceof Error ? e.message : String(e) });
+                if (stopOnError) break;
+              }
+              if (s.delayMs && i < steps.length - 1) await new Promise((r) => setTimeout(r, Math.min(6e4, Math.max(0, s.delayMs))));
             }
+            value = { batch: true, total: steps.length, ran: results.length, ok: results.filter((r) => r.ok).length, results };
           } else {
-            if (cmd.op === "fill_form") {
-              value = await run("fill_form", cmd.args);
-            } else {
-              value = await run(cmd.op, cmd.args);
-            }
+            value = await execOne(cmd.op, cmd.args, narration || void 0);
           }
-          if (prefsRef.current.fx) FX?.after(cmd);
           send({ t: "result", id: cmd.id, ok: true, value });
         } catch (err) {
           if (prefsRef.current.fx) FX?.fail(cmd);
@@ -415,8 +437,18 @@ function AgentBridge() {
     };
   }, []);
   if (!mounted) return null;
-  const takeOver = () => sendRef.current?.({ t: "takeover" });
-  const allowAgents = () => sendRef.current?.({ t: "allowAgents" });
+  const takeOver = () => {
+    setOwner(null);
+    setIntroAgent(null);
+    setLocked(true);
+    if (prefsRef.current.fx) FX?.showBar("You're in control \u2014 agents are blocked");
+    sendRef.current?.({ t: "takeover" });
+  };
+  const allowAgents = () => {
+    setLocked(false);
+    if (prefsRef.current.fx) FX?.showBar("Idle \u2014 unclaimed (open to agents)");
+    sendRef.current?.({ t: "allowAgents" });
+  };
   return /* @__PURE__ */ jsxs(Fragment, { children: [
     /* @__PURE__ */ jsx(
       "div",
