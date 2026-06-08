@@ -266,6 +266,12 @@ export default function AgentBridge() {
   const [owner, setOwner] = useState<{ name: string; intent: string } | null>(null);
   const ownerRef = useRef<{ name: string; intent: string } | null>(null);
   ownerRef.current = owner;
+  // User-takeover lock: when true, the human is in control and agents can't claim this tab.
+  const [locked, setLocked] = useState(false);
+  // Brief "just claimed" intro animation flag.
+  const [introAgent, setIntroAgent] = useState<{ name: string; intent: string } | null>(null);
+  // A ref to the live WS send() so HUD buttons (take over / allow) can post to the broker.
+  const sendRef = useRef<((o: unknown) => void) | null>(null);
   // Start from deterministic defaults so SSR and the first client render match (no hydration
   // mismatch); load the real persisted prefs only after mount.
   const [prefs, setPrefs] = useState<Prefs>(DEFAULT_PREFS);
@@ -382,15 +388,32 @@ export default function AgentBridge() {
           return;
         }
         if (msg.t === 'registered') return; // ack
-        // An agent claimed this tab — go active; show who + why.
+        // An agent claimed this tab — go active; show who + why + a brief takeover intro.
         if (msg.t === 'claimed') {
           const o = { name: String(msg.agentName || 'agent'), intent: String(msg.intent || '') };
           setOwner(o);
+          setLocked(false);
+          setIntroAgent(o); // dramatic intro overlay (auto-fades)
+          setTimeout(() => setIntroAgent(null), 2200);
           if (prefsRef.current.fx) FX?.showBar(`Controlled by ${o.name}${o.intent ? ' — ' + o.intent : ''}`);
           return;
         }
         if (msg.t === 'released') {
           setOwner(null);
+          setIntroAgent(null);
+          if (prefsRef.current.fx) FX?.showBar('Idle — unclaimed (open to agents)');
+          return;
+        }
+        if (msg.t === 'lockedByUser') {
+          // User took over (this tab, possibly restored after reload). Human is in control.
+          setOwner(null);
+          setLocked(true);
+          setIntroAgent(null);
+          if (prefsRef.current.fx) FX?.showBar("You're in control — agents are blocked");
+          return;
+        }
+        if (msg.t === 'unlocked') {
+          setLocked(false);
           if (prefsRef.current.fx) FX?.showBar('Idle — unclaimed (open to agents)');
           return;
         }
@@ -479,6 +502,7 @@ export default function AgentBridge() {
     const send = (obj: unknown) => {
       if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj));
     };
+    sendRef.current = send; // expose to HUD buttons (take over / allow agents)
 
     // Forward ALL browser console output (and uncaught errors) so the agent sees client-side activity.
     const levels = ['log', 'info', 'warn', 'error', 'debug'] as const;
@@ -524,6 +548,9 @@ export default function AgentBridge() {
   // (sessionStorage tab id, localStorage prefs), so SSR output would never match the client.
   if (!mounted) return null;
 
+  const takeOver = () => sendRef.current?.({ t: 'takeover' });
+  const allowAgents = () => sendRef.current?.({ t: 'allowAgents' });
+
   return (
     <>
       {/* Full-screen, non-interactive FX layer (cursor, spotlight, tooltip, ripples, toasts). */}
@@ -532,6 +559,7 @@ export default function AgentBridge() {
         data-agent-bridge-hud
         style={{ position: 'fixed', inset: 0, zIndex: 2147483646, pointerEvents: 'none', overflow: 'hidden' }}
       />
+      <ControlOverlay owner={owner} locked={locked} introAgent={introAgent} onTakeOver={takeOver} onAllow={allowAgents} fx={prefs.fx} />
       <Hud
         status={status}
         busy={busy}
@@ -547,6 +575,154 @@ export default function AgentBridge() {
         onMove={(pos) => setPrefs((p) => ({ ...p, pos }))}
       />
     </>
+  );
+}
+
+// ---- Agent-control overlay: glowing frame + "Take over" badge while an agent controls the tab,
+// a brief dramatic intro card on claim, and a "You're in control / Allow agents" badge when the
+// user has taken over. Pointer-events are limited to the buttons so the page stays usable. --------
+function ControlOverlay({
+  owner,
+  locked,
+  introAgent,
+  onTakeOver,
+  onAllow,
+  fx,
+}: {
+  owner: { name: string; intent: string } | null;
+  locked: boolean;
+  introAgent: { name: string; intent: string } | null;
+  onTakeOver: () => void;
+  onAllow: () => void;
+  fx: boolean;
+}) {
+  if (!fx) {
+    // Even with FX off, keep a minimal takeover affordance when an agent controls the tab.
+    if (!owner && !locked) return null;
+  }
+  const active = !!owner;
+  const badgeBtn: React.CSSProperties = {
+    pointerEvents: 'auto',
+    cursor: 'pointer',
+    border: 'none',
+    borderRadius: 8,
+    padding: '7px 12px',
+    font: '700 12px/1 ui-sans-serif, system-ui, sans-serif',
+    color: '#fff',
+  };
+  return (
+    <div data-agent-bridge-hud style={{ position: 'fixed', inset: 0, zIndex: 2147483645, pointerEvents: 'none' }}>
+      {/* Glowing frame while an agent is in control */}
+      {active && (
+        <div
+          style={{
+            position: 'absolute',
+            inset: 0,
+            pointerEvents: 'none',
+            boxShadow: 'inset 0 0 0 3px rgba(56,189,248,.9), inset 0 0 40px 6px rgba(56,189,248,.35)',
+            animation: 'agentFramePulse 2.2s ease-in-out infinite',
+          }}
+        />
+      )}
+
+      {/* Top-center control badge (agent in control) */}
+      {active && (
+        <div
+          style={{
+            position: 'absolute',
+            top: 0,
+            left: '50%',
+            transform: 'translateX(-50%)',
+            display: 'flex',
+            alignItems: 'center',
+            gap: 12,
+            padding: '8px 14px',
+            borderRadius: '0 0 14px 14px',
+            background: 'linear-gradient(135deg,#0ea5e9,#6366f1)',
+            color: '#fff',
+            font: '600 13px/1.3 ui-sans-serif, system-ui, sans-serif',
+            boxShadow: '0 8px 28px rgba(0,0,0,.45)',
+            maxWidth: '92vw',
+          }}
+        >
+          <span style={{ animation: 'agentThink 1.6s ease-in-out infinite' }}>✦</span>
+          <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+            <strong>{owner!.name}</strong> is controlling this tab{owner!.intent ? ` — ${owner!.intent}` : ''}
+          </span>
+          <button style={{ ...badgeBtn, background: 'rgba(255,255,255,.18)' }} onClick={onTakeOver} title="Disconnect the agent and take control">
+            ✋ Take over
+          </button>
+        </div>
+      )}
+
+      {/* User-in-control badge (after takeover) */}
+      {locked && !active && (
+        <div
+          style={{
+            position: 'absolute',
+            top: 0,
+            left: '50%',
+            transform: 'translateX(-50%)',
+            display: 'flex',
+            alignItems: 'center',
+            gap: 12,
+            padding: '8px 14px',
+            borderRadius: '0 0 14px 14px',
+            background: '#16a34a',
+            color: '#fff',
+            font: '600 13px/1.3 ui-sans-serif, system-ui, sans-serif',
+            boxShadow: '0 8px 28px rgba(0,0,0,.4)',
+          }}
+        >
+          <span>🧑 You're in control — agents are blocked</span>
+          <button style={{ ...badgeBtn, background: 'rgba(255,255,255,.2)' }} onClick={onAllow} title="Let agents claim this tab again">
+            Allow agents
+          </button>
+        </div>
+      )}
+
+      {/* Dramatic intro card on claim (auto-fades) */}
+      {introAgent && (
+        <div
+          style={{
+            position: 'absolute',
+            inset: 0,
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            background: 'rgba(2,6,23,.55)',
+            animation: 'agentIntroFade 2.2s ease forwards',
+            pointerEvents: 'none',
+          }}
+        >
+          <div
+            style={{
+              padding: '20px 26px',
+              borderRadius: 16,
+              background: 'linear-gradient(135deg,#0ea5e9,#6366f1)',
+              color: '#fff',
+              textAlign: 'center',
+              boxShadow: '0 20px 60px rgba(0,0,0,.55)',
+              animation: 'agentIntroPop .5s cubic-bezier(.22,1,.36,1)',
+            }}
+          >
+            <div style={{ fontSize: 30, marginBottom: 6 }}>🤖</div>
+            <div style={{ font: '800 18px/1.2 ui-sans-serif, system-ui, sans-serif' }}>{introAgent.name} took control</div>
+            {introAgent.intent && (
+              <div style={{ marginTop: 6, opacity: 0.92, font: '500 13px/1.4 ui-sans-serif, system-ui, sans-serif', maxWidth: 360 }}>
+                {introAgent.intent}
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+
+      <style>{`
+        @keyframes agentFramePulse{0%,100%{box-shadow:inset 0 0 0 3px rgba(56,189,248,.85),inset 0 0 40px 6px rgba(56,189,248,.28)}50%{box-shadow:inset 0 0 0 3px rgba(125,211,252,1),inset 0 0 60px 10px rgba(56,189,248,.5)}}
+        @keyframes agentIntroFade{0%{opacity:0}15%{opacity:1}75%{opacity:1}100%{opacity:0}}
+        @keyframes agentIntroPop{0%{transform:scale(.8);opacity:0}100%{transform:scale(1);opacity:1}}
+      `}</style>
+    </div>
   );
 }
 

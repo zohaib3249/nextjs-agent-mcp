@@ -27,6 +27,7 @@ export class Broker {
     this.agents = new Map(); // agentId -> ws
     this.tabs = new Map(); // tabId -> ws (only currently-connected tabs)
     this.binding = new Map(); // tabId -> { agentId, intent } (survives a tab reload)
+    this.locked = new Set(); // tabIds the USER took over — not claimable until unlocked
     this._seq = 0;
   }
 
@@ -75,6 +76,13 @@ export class Broker {
         return this._claim(ws, m);
       case 'release':
         return this._release(ws, m.tabId);
+      case 'takeover':
+        // From a TAB: the user clicked "Take over". Release any agent + lock the tab so agents
+        // cannot reclaim it until the user allows agents again.
+        return this._takeover(ws);
+      case 'allowAgents':
+        // From a TAB: the user re-allows agents (unlock).
+        return this._allowAgents(ws);
       case 'cmd':
         return this._cmd(ws, m);
       case 'result': {
@@ -112,6 +120,8 @@ export class Broker {
     ws._meta = { role: 'tab', id: tabId, url: m.url, pathname: m.pathname, title: m.title, userAgent: m.userAgent };
     this.tabs.set(tabId, ws);
     this._send(ws, { t: 'registered', role: 'tab', tabId });
+    // Human-locked across a reload → restore the "you're in control" state.
+    if (this.locked.has(tabId)) this._send(ws, { t: 'lockedByUser' });
     // If this tabId was already bound (e.g. the tab just RELOADED), restore ownership so the page
     // doesn't go back to "unclaimed". Re-notify the tab AND the owning agent.
     const b = this.binding.get(tabId);
@@ -136,13 +146,14 @@ export class Broker {
     const agentId = ws._meta.id;
     let tabId = m.tabId;
     if (tabId) {
+      if (this.locked.has(tabId)) return this._send(ws, { t: 'error', msg: `tab ${tabId} is under human control (user took over)` });
       const b = this.binding.get(tabId);
       if (b && b.agentId !== agentId) return this._send(ws, { t: 'error', msg: `tab ${tabId} is owned by ${b.agentId}` });
       if (!this.tabs.has(tabId)) return this._send(ws, { t: 'error', msg: `no tab ${tabId}` });
     } else {
-      // Pick a FREE (connected + unbound) tab. If `match` is given, prefer a free tab whose url or
-      // title contains it — so an agent can claim "the tab on /checkout" rather than any free one.
-      const free = [...this.tabs.entries()].filter(([id]) => !this.binding.has(id));
+      // Pick a FREE (connected + unbound + NOT human-locked) tab. If `match` is given, prefer a
+      // free tab whose url/title contains it.
+      const free = [...this.tabs.entries()].filter(([id]) => !this.binding.has(id) && !this.locked.has(id));
       const match = (m.match || '').toLowerCase();
       const pick =
         (match && free.find(([, w]) => `${w._meta.url || ''} ${w._meta.title || ''}`.toLowerCase().includes(match))) ||
@@ -166,6 +177,29 @@ export class Broker {
       this._send(ws, { t: 'released', tabId });
       this._broadcastTabsToAgents();
     }
+  }
+
+  // User clicked "Take over" on a tab: kick the owning agent and lock the tab from future claims.
+  _takeover(ws) {
+    if (ws._meta.role !== 'tab') return;
+    const tabId = ws._meta.id;
+    const b = this.binding.get(tabId);
+    if (b) {
+      this.binding.delete(tabId);
+      const ag = this.agents.get(b.agentId);
+      if (ag) this._send(ag, { t: 'released', tabId, reason: 'user-takeover' }); // tell the agent it lost the tab
+    }
+    this.locked.add(tabId);
+    this._send(ws, { t: 'lockedByUser' }); // confirm to the tab
+    this._broadcastTabsToAgents();
+  }
+
+  // User re-allows agents on a tab (unlock).
+  _allowAgents(ws) {
+    if (ws._meta.role !== 'tab') return;
+    this.locked.delete(ws._meta.id);
+    this._send(ws, { t: 'unlocked' });
+    this._broadcastTabsToAgents();
   }
 
   _cmd(ws, m) {
@@ -217,7 +251,8 @@ export class Broker {
         title: ws._meta.title,
         boundAgentId: b ? b.agentId : null,
         boundAgentName: b ? this.agents.get(b.agentId)?._meta.name || b.agentId : null,
-        free: !b,
+        lockedByUser: this.locked.has(tabId),
+        free: !b && !this.locked.has(tabId),
       };
     });
   }

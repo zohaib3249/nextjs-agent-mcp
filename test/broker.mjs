@@ -135,6 +135,29 @@ function client() {
   const byMatch = await ag4.waitFor((m) => m.t === 'claimed');
   ok(!!byMatch && byMatch.tabId === 'tabC', 'claim by url match picks the right free tab');
 
+  // --- TAKE OVER: the user clicks Take over on tabC (owned by ag4). ---
+  ag4.inbox.length = 0;
+  tabC.send({ t: 'takeover' });
+  const lockedAck = await tabC.waitFor((m) => m.t === 'lockedByUser');
+  ok(!!lockedAck, 'tab gets lockedByUser after take over');
+  const agKicked = await ag4.waitFor((m) => m.t === 'released' && m.reason === 'user-takeover');
+  ok(!!agKicked, 'owning agent is told it lost the tab (user-takeover)');
+
+  // A locked tab is NOT claimable — even explicitly by id.
+  ag4.inbox.length = 0;
+  ag4.send({ t: 'claim', tabId: 'tabC', intent: 'retry' });
+  const denied = await ag4.waitFor((m) => m.t === 'error');
+  ok(!!denied && /human control/.test(denied.msg || ''), 'locked tab cannot be reclaimed by an agent');
+
+  // Allow agents again → unlock → claimable.
+  tabC.send({ t: 'allowAgents' });
+  const unlocked = await tabC.waitFor((m) => m.t === 'unlocked');
+  ok(!!unlocked, 'allowAgents unlocks the tab');
+  ag4.inbox.length = 0;
+  ag4.send({ t: 'claim', tabId: 'tabC', intent: 'again' });
+  const reclaimed = await ag4.waitFor((m) => m.t === 'claimed');
+  ok(!!reclaimed, 'after unlock, an agent can claim the tab again');
+
   console.log(failed === 0 ? '\nALL BROKER TESTS PASSED ✓' : `\n${failed} TEST(S) FAILED ✗`);
   process.exit(failed === 0 ? 0 : 1);
 })();

@@ -192,6 +192,9 @@ function AgentBridge() {
   const [owner, setOwner] = useState(null);
   const ownerRef = useRef(null);
   ownerRef.current = owner;
+  const [locked, setLocked] = useState(false);
+  const [introAgent, setIntroAgent] = useState(null);
+  const sendRef = useRef(null);
   const [prefs, setPrefs] = useState(DEFAULT_PREFS);
   const [mounted, setMounted] = useState(false);
   useEffect(() => {
@@ -289,11 +292,27 @@ function AgentBridge() {
         if (msg.t === "claimed") {
           const o = { name: String(msg.agentName || "agent"), intent: String(msg.intent || "") };
           setOwner(o);
+          setLocked(false);
+          setIntroAgent(o);
+          setTimeout(() => setIntroAgent(null), 2200);
           if (prefsRef.current.fx) FX?.showBar(`Controlled by ${o.name}${o.intent ? " \u2014 " + o.intent : ""}`);
           return;
         }
         if (msg.t === "released") {
           setOwner(null);
+          setIntroAgent(null);
+          if (prefsRef.current.fx) FX?.showBar("Idle \u2014 unclaimed (open to agents)");
+          return;
+        }
+        if (msg.t === "lockedByUser") {
+          setOwner(null);
+          setLocked(true);
+          setIntroAgent(null);
+          if (prefsRef.current.fx) FX?.showBar("You're in control \u2014 agents are blocked");
+          return;
+        }
+        if (msg.t === "unlocked") {
+          setLocked(false);
           if (prefsRef.current.fx) FX?.showBar("Idle \u2014 unclaimed (open to agents)");
           return;
         }
@@ -363,6 +382,7 @@ function AgentBridge() {
     const send = (obj) => {
       if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj));
     };
+    sendRef.current = send;
     const levels = ["log", "info", "warn", "error", "debug"];
     const orig = {};
     const fmt = (a) => a.map((v) => {
@@ -395,6 +415,8 @@ function AgentBridge() {
     };
   }, []);
   if (!mounted) return null;
+  const takeOver = () => sendRef.current?.({ t: "takeover" });
+  const allowAgents = () => sendRef.current?.({ t: "allowAgents" });
   return /* @__PURE__ */ jsxs(Fragment, { children: [
     /* @__PURE__ */ jsx(
       "div",
@@ -404,6 +426,7 @@ function AgentBridge() {
         style: { position: "fixed", inset: 0, zIndex: 2147483646, pointerEvents: "none", overflow: "hidden" }
       }
     ),
+    /* @__PURE__ */ jsx(ControlOverlay, { owner, locked, introAgent, onTakeOver: takeOver, onAllow: allowAgents, fx: prefs.fx }),
     /* @__PURE__ */ jsx(
       Hud,
       {
@@ -421,6 +444,138 @@ function AgentBridge() {
         onMove: (pos) => setPrefs((p) => ({ ...p, pos }))
       }
     )
+  ] });
+}
+function ControlOverlay({
+  owner,
+  locked,
+  introAgent,
+  onTakeOver,
+  onAllow,
+  fx
+}) {
+  if (!fx) {
+    if (!owner && !locked) return null;
+  }
+  const active = !!owner;
+  const badgeBtn = {
+    pointerEvents: "auto",
+    cursor: "pointer",
+    border: "none",
+    borderRadius: 8,
+    padding: "7px 12px",
+    font: "700 12px/1 ui-sans-serif, system-ui, sans-serif",
+    color: "#fff"
+  };
+  return /* @__PURE__ */ jsxs("div", { "data-agent-bridge-hud": true, style: { position: "fixed", inset: 0, zIndex: 2147483645, pointerEvents: "none" }, children: [
+    active && /* @__PURE__ */ jsx(
+      "div",
+      {
+        style: {
+          position: "absolute",
+          inset: 0,
+          pointerEvents: "none",
+          boxShadow: "inset 0 0 0 3px rgba(56,189,248,.9), inset 0 0 40px 6px rgba(56,189,248,.35)",
+          animation: "agentFramePulse 2.2s ease-in-out infinite"
+        }
+      }
+    ),
+    active && /* @__PURE__ */ jsxs(
+      "div",
+      {
+        style: {
+          position: "absolute",
+          top: 0,
+          left: "50%",
+          transform: "translateX(-50%)",
+          display: "flex",
+          alignItems: "center",
+          gap: 12,
+          padding: "8px 14px",
+          borderRadius: "0 0 14px 14px",
+          background: "linear-gradient(135deg,#0ea5e9,#6366f1)",
+          color: "#fff",
+          font: "600 13px/1.3 ui-sans-serif, system-ui, sans-serif",
+          boxShadow: "0 8px 28px rgba(0,0,0,.45)",
+          maxWidth: "92vw"
+        },
+        children: [
+          /* @__PURE__ */ jsx("span", { style: { animation: "agentThink 1.6s ease-in-out infinite" }, children: "\u2726" }),
+          /* @__PURE__ */ jsxs("span", { style: { overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }, children: [
+            /* @__PURE__ */ jsx("strong", { children: owner.name }),
+            " is controlling this tab",
+            owner.intent ? ` \u2014 ${owner.intent}` : ""
+          ] }),
+          /* @__PURE__ */ jsx("button", { style: { ...badgeBtn, background: "rgba(255,255,255,.18)" }, onClick: onTakeOver, title: "Disconnect the agent and take control", children: "\u270B Take over" })
+        ]
+      }
+    ),
+    locked && !active && /* @__PURE__ */ jsxs(
+      "div",
+      {
+        style: {
+          position: "absolute",
+          top: 0,
+          left: "50%",
+          transform: "translateX(-50%)",
+          display: "flex",
+          alignItems: "center",
+          gap: 12,
+          padding: "8px 14px",
+          borderRadius: "0 0 14px 14px",
+          background: "#16a34a",
+          color: "#fff",
+          font: "600 13px/1.3 ui-sans-serif, system-ui, sans-serif",
+          boxShadow: "0 8px 28px rgba(0,0,0,.4)"
+        },
+        children: [
+          /* @__PURE__ */ jsx("span", { children: "\u{1F9D1} You're in control \u2014 agents are blocked" }),
+          /* @__PURE__ */ jsx("button", { style: { ...badgeBtn, background: "rgba(255,255,255,.2)" }, onClick: onAllow, title: "Let agents claim this tab again", children: "Allow agents" })
+        ]
+      }
+    ),
+    introAgent && /* @__PURE__ */ jsx(
+      "div",
+      {
+        style: {
+          position: "absolute",
+          inset: 0,
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "center",
+          background: "rgba(2,6,23,.55)",
+          animation: "agentIntroFade 2.2s ease forwards",
+          pointerEvents: "none"
+        },
+        children: /* @__PURE__ */ jsxs(
+          "div",
+          {
+            style: {
+              padding: "20px 26px",
+              borderRadius: 16,
+              background: "linear-gradient(135deg,#0ea5e9,#6366f1)",
+              color: "#fff",
+              textAlign: "center",
+              boxShadow: "0 20px 60px rgba(0,0,0,.55)",
+              animation: "agentIntroPop .5s cubic-bezier(.22,1,.36,1)"
+            },
+            children: [
+              /* @__PURE__ */ jsx("div", { style: { fontSize: 30, marginBottom: 6 }, children: "\u{1F916}" }),
+              /* @__PURE__ */ jsxs("div", { style: { font: "800 18px/1.2 ui-sans-serif, system-ui, sans-serif" }, children: [
+                introAgent.name,
+                " took control"
+              ] }),
+              introAgent.intent && /* @__PURE__ */ jsx("div", { style: { marginTop: 6, opacity: 0.92, font: "500 13px/1.4 ui-sans-serif, system-ui, sans-serif", maxWidth: 360 }, children: introAgent.intent })
+            ]
+          }
+        )
+      }
+    ),
+    /* @__PURE__ */ jsx("style", { children: `
+        @keyframes agentFramePulse{0%,100%{box-shadow:inset 0 0 0 3px rgba(56,189,248,.85),inset 0 0 40px 6px rgba(56,189,248,.28)}50%{box-shadow:inset 0 0 0 3px rgba(125,211,252,1),inset 0 0 60px 10px rgba(56,189,248,.5)}}
+        @keyframes agentIntroFade{0%{opacity:0}15%{opacity:1}75%{opacity:1}100%{opacity:0}}
+        @keyframes agentIntroPop{0%{transform:scale(.8);opacity:0}100%{transform:scale(1);opacity:1}}
+      ` })
   ] });
 }
 var _AgentFx = class _AgentFx {
