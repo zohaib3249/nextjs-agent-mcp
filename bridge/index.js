@@ -46,6 +46,15 @@ function netPush(e) {
   NET.entries.push(entry);
   if (NET.entries.length > NET.max) NET.entries.shift();
 }
+function errorUrls(limit = 20) {
+  if (limit <= 0) return [];
+  const out = [];
+  for (let i = NET.entries.length - 1; i >= 0 && out.length < limit; i--) {
+    const e = NET.entries[i];
+    if (typeof e.status === "number" && e.status >= 400) out.push({ url: e.url, status: e.status, type: e.type });
+  }
+  return out;
+}
 function resourceType(initiatorType, url) {
   if (initiatorType === "xmlhttprequest") return "xhr";
   if (initiatorType === "fetch") return "fetch";
@@ -1015,11 +1024,20 @@ async function run(op, args) {
       return doOverview();
     case "navigate": {
       const url = String(args.url);
+      const errLimit = typeof args.return_error_urls === "number" ? args.return_error_urls : 20;
       const before = location.href;
       location.assign(url);
       await new Promise((r) => setTimeout(r, 350));
       const navigatedWithinDoc = location.href !== before && document.readyState === "complete";
-      return { navigated: url, sameDocument: navigatedWithinDoc, overview: doOverview() };
+      const errors = errorUrls(errLimit);
+      return {
+        navigated: url,
+        sameDocument: navigatedWithinDoc,
+        overview: doOverview(),
+        errorUrls: errors,
+        // failed requests {url, status, type} seen so far (top N, newest first)
+        errorCount: errors.length
+      };
     }
     case "reload":
       if (args.hard) location.replace(location.href.split("#")[0]);

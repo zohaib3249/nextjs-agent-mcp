@@ -1,7 +1,7 @@
 # nextjs-agent-mcp
 
-An **MCP server** that lets an AI agent **drive and inspect a running Next.js app** — no Playwright,
-no headless Chromium. It works two ways:
+An **MCP server** that lets an AI agent **drive and inspect a running Next.js app**. It works three
+ways:
 
 - **Mode A — Headless introspection.** Reads the App Router route map and captures structured
   dev-server errors straight from the framework. No browser required.
@@ -10,6 +10,10 @@ no headless Chromium. It works two ways:
   fill, navigate, snapshot the page as a structured model, walk the React component tree, capture
   network calls, read/write storage, run JS, screenshot. A floating HUD lets you watch it work
   (status bar with typed narration, traveling cursor, spotlight).
+- **Mode C — Chrome control (CDP).** Optionally manage the real browser via the DevTools Protocol:
+  launch Chrome with a chosen **profile**, list **all** open tabs, open/activate/close tabs. No
+  Playwright/puppeteer — just Node + Chrome's debug endpoint. Tabs that load your app + the bridge
+  then connect to the broker for claim/drive as usual.
 
 ### Connection model (broker + claim)
 Multiple agents and multiple tabs coexist cleanly:
@@ -157,6 +161,20 @@ const nextConfig = { transpilePackages: ['nextjs-agent-mcp'] };
 
 Every Mode-B tool acts on the agent's **bound tab** and accepts an optional `message` (typed into
 the on-page status bar). Claim a tab with `claim_tab` before using them.
+
+`navigate` also returns the page's **failed network requests** (4xx/5xx) — top 20 `{url, status,
+type}` by default; pass `return_error_urls: N` for more (or `0` to skip).
+
+### Mode C — Chrome control (CDP, real browser)
+| Tool | What it does |
+|---|---|
+| `chrome_launch` | Launch Chrome with `--remote-debugging` + a `profile` dir (or attach if already up). `url`, `headless` optional. |
+| `chrome_tabs` | List **all** open browser tabs (id, title, url, active) — not just bridge-connected ones. |
+| `chrome_open_tab` | Open a new real browser tab at `url`. |
+| `chrome_activate_tab` / `chrome_close_tab` | Focus / close a tab by `id`. |
+
+Run the MCP with `--chrome-port` (default 9222) and optionally `--chrome-path`. Different `profile`
+dirs keep separate logins/sessions.
 
 ### A typical agent loop
 `claim_tab({intent})` → `page_context`/`overview` → `snapshot` (or `find`) → `fill_form` /

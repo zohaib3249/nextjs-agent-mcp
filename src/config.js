@@ -11,6 +11,8 @@ export function loadConfig(argv = process.argv.slice(2)) {
     else if (a === '--ws-port') opts.wsPort = Number(argv[++i]);
     else if (a === '--http-port') opts.httpPort = Number(argv[++i]);
     else if (a === '--agent-name') opts.agentName = argv[++i];
+    else if (a === '--chrome-port') opts.chromePort = Number(argv[++i]);
+    else if (a === '--chrome-path') opts.chromePath = argv[++i];
   }
 
   const project = resolve(opts.project || process.env.NEXTJS_MCP_PROJECT || process.cwd());
@@ -20,6 +22,9 @@ export function loadConfig(argv = process.argv.slice(2)) {
   // Identity for the broker registry: a human-readable name + a process-unique id.
   const agentName = opts.agentName || process.env.NEXTJS_MCP_AGENT_NAME || 'agent';
   const agentId = 'ag-' + Math.random().toString(36).slice(2, 8) + '-' + (process.pid % 100000);
+  // Chrome DevTools Protocol control (optional): manage real browser profiles/tabs.
+  const chromePort = opts.chromePort || Number(process.env.NEXTJS_MCP_CHROME_PORT) || 9222;
+  const chromePath = opts.chromePath || process.env.CHROME_PATH || null;
 
-  return { project, wsPort, httpPort, agentName, agentId };
+  return { project, wsPort, httpPort, agentName, agentId, chromePort, chromePath };
 }

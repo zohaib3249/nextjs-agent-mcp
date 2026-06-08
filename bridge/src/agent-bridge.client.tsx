@@ -88,6 +88,18 @@ function netPush(e: Omit<NetEntry, 'id' | 'ts'>) {
   if (NET.entries.length > NET.max) NET.entries.shift();
 }
 
+// Failed requests (HTTP error codes) captured so far, newest first, as compact {url, status, type}.
+// `limit` caps how many are returned (default 20). Used by navigate so the agent sees broken calls.
+function errorUrls(limit = 20): Array<{ url: string; status: number; type: string }> {
+  if (limit <= 0) return [];
+  const out: Array<{ url: string; status: number; type: string }> = [];
+  for (let i = NET.entries.length - 1; i >= 0 && out.length < limit; i--) {
+    const e = NET.entries[i];
+    if (typeof e.status === 'number' && e.status >= 400) out.push({ url: e.url, status: e.status, type: e.type });
+  }
+  return out;
+}
+
 // Classify a resource entry by initiatorType / extension.
 function resourceType(initiatorType: string, url: string): string {
   if (initiatorType === 'xmlhttprequest') return 'xhr';
@@ -1249,6 +1261,8 @@ async function run(op: string, args: Record<string, unknown>): Promise<unknown> 
       return doOverview();
     case 'navigate': {
       const url = String(args.url);
+      // How many failed (4xx/5xx) request URLs to return; default 20, 0 to skip.
+      const errLimit = typeof args.return_error_urls === 'number' ? (args.return_error_urls as number) : 20;
       // SPA route changes keep the page alive (history API) — we can return the new overview after
       // a short settle. A cross-document load unloads the page, so the overview reflects the
       // CURRENT page; the agent should call `overview` again once the new page has loaded.
@@ -1257,7 +1271,14 @@ async function run(op: string, args: Record<string, unknown>): Promise<unknown> 
       // Give SPA navigations a brief moment to re-render, then snapshot the overview.
       await new Promise((r) => setTimeout(r, 350));
       const navigatedWithinDoc = location.href !== before && document.readyState === 'complete';
-      return { navigated: url, sameDocument: navigatedWithinDoc, overview: doOverview() };
+      const errors = errorUrls(errLimit);
+      return {
+        navigated: url,
+        sameDocument: navigatedWithinDoc,
+        overview: doOverview(),
+        errorUrls: errors, // failed requests {url, status, type} seen so far (top N, newest first)
+        errorCount: errors.length,
+      };
     }
     case 'reload':
       // location.reload() can't force-bypass cache portably; navigate to self with a buster for hard.

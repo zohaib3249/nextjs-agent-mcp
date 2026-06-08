@@ -10,9 +10,12 @@ import { loadConfig } from './config.js';
 import { buildRouteMap } from './modeA/routes.js';
 import { ErrorTracker } from './modeA/errors.js';
 import { AgentClient } from './modeB/agentClient.js';
+import { ChromeController } from './modeB/chrome.js';
 
 const config = loadConfig();
 const tracker = new ErrorTracker();
+// Optional real-browser control via CDP (open profiles, list/open/close/activate tabs).
+const chrome = new ChromeController({ port: config.chromePort, chromePath: config.chromePath });
 // `bridge` is now a broker CLIENT (registers this MCP as an agent; binds one tab at a time).
 const bridge = new AgentClient({ port: config.wsPort, agentId: config.agentId, name: config.agentName });
 
@@ -410,12 +413,12 @@ server.registerTool(
   {
     title: 'Navigate the tab',
     description:
-      'Navigate a tab to a URL and return a page `overview` (landmark map: header/nav/sidebars/sections/tabs/headings/footer/openOverlays). Remember locale prefix, e.g. /en/.... ' +
-      'For a full-document load the overview reflects the page at call time — if it just unloaded, call `overview` again once it has loaded (use wait_for first).',
-    inputSchema: { url: z.string(), ...MSG },
+      'Navigate a tab to a URL and return: a page `overview` (landmark map: header/nav/sidebars/sections/tabs/headings/footer/openOverlays) AND `errorUrls` — the page\'s FAILED network requests as `{url, status, type}` (4xx/5xx like 404/401/403/500/502), newest first. ' +
+      'By default the top 20 error urls are returned; pass `return_error_urls` to get more (or 0 to skip). Remember locale prefix, e.g. /en/.... For a full-document load, the overview reflects the page at call time — if it just unloaded, call `overview`/`network_calls` again once it has loaded.',
+    inputSchema: { url: z.string(), return_error_urls: z.number().int().optional(), ...MSG },
   },
-  async ({ url, message }) =>
-    json(await bridge.dispatch('navigate', { url }, opts({ message }, { timeoutMs: 8000 })))
+  async ({ url, return_error_urls, message }) =>
+    json(await bridge.dispatch('navigate', { url, return_error_urls }, opts({ message }, { timeoutMs: 8000 })))
 );
 
 server.registerTool(
@@ -524,6 +527,63 @@ server.registerTool(
   },
   async ({ query, in: scopes, message }) =>
     json(await bridge.dispatch('find', { query, in: scopes }, opts({ message })))
+);
+
+// ---- Chrome control (CDP) — real browser profiles + tabs ------------------
+// These manage the actual browser process, beyond the in-page bridge: open a profile, see every
+// open tab, open/close/activate tabs. Launch Chrome via chrome_launch (with the app's dev URL),
+// then the in-page <AgentBridge/> on those tabs connects to the broker as usual for claim/drive.
+
+server.registerTool(
+  'chrome_launch',
+  {
+    title: 'Launch / attach Chrome (with a profile)',
+    description:
+      'Launch Chrome with remote debugging and a chosen profile directory (`profile` = a --user-data-dir path; different dirs keep separate logins/sessions). If a debuggable Chrome is already on the port, attaches instead. Pass `url` to open initially (e.g. your app), `headless` for no window. After this you can chrome_tabs / chrome_open_tab, and tabs that load your app + <AgentBridge/> will connect to the broker for claim/drive.',
+    inputSchema: { profile: z.string().optional(), url: z.string().optional(), headless: z.boolean().optional() },
+  },
+  async ({ profile, url, headless }) => json(await chrome.launch({ profile: profile ?? null, url: url ?? null, headless: !!headless }))
+);
+
+server.registerTool(
+  'chrome_tabs',
+  {
+    title: 'List ALL browser tabs (CDP)',
+    description:
+      'List every open tab in the controlled Chrome (id, title, url, active) — the real browser, not just bridge-connected tabs. Requires chrome_launch first (or an already-debuggable Chrome on --chrome-port).',
+    inputSchema: {},
+  },
+  async () => json(await chrome.tabs())
+);
+
+server.registerTool(
+  'chrome_open_tab',
+  {
+    title: 'Open a browser tab (CDP)',
+    description: 'Open a new real browser tab at `url` in the controlled Chrome. Returns its id/url. Use chrome_tabs to see all tabs.',
+    inputSchema: { url: z.string() },
+  },
+  async ({ url }) => json(await chrome.openTab(url))
+);
+
+server.registerTool(
+  'chrome_activate_tab',
+  {
+    title: 'Focus a browser tab (CDP)',
+    description: 'Bring a browser tab to the foreground by its `id` (from chrome_tabs).',
+    inputSchema: { id: z.string() },
+  },
+  async ({ id }) => json(await chrome.activateTab(id))
+);
+
+server.registerTool(
+  'chrome_close_tab',
+  {
+    title: 'Close a browser tab (CDP)',
+    description: 'Close a browser tab by its `id` (from chrome_tabs).',
+    inputSchema: { id: z.string() },
+  },
+  async ({ id }) => json(await chrome.closeTab(id))
 );
 
 async function main() {
